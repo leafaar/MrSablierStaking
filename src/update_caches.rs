@@ -1,0 +1,78 @@
+use {
+    crate::{
+        IndexedStakingAccountsThreadSafe, IndexedUserStakingAccountsThreadSafe,
+        StakingRoundNextResolveTimeCacheThreadSafe, UserStakingClaimCacheThreadSafe,
+    },
+    adrena_abi::{Pubkey, Staking, UserStaking, ROUND_MIN_DURATION_SECONDS},
+};
+
+pub async fn update_staking_round_next_resolve_time_cache_for_account(
+    staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
+    staking_account_key: &Pubkey,
+    staking_account: &Staking,
+) {
+    let current_time = chrono::Utc::now().timestamp();
+    // How long has the current staking round been running for?
+    let round_current_duration = current_time - staking_account.current_staking_round.start_time;
+    // If the current round has been running for longer than the minimum duration, set the next resolve time to be now
+    let next_resolve_time = if round_current_duration >= ROUND_MIN_DURATION_SECONDS {
+        current_time
+    } else {
+        staking_account.current_staking_round.start_time + ROUND_MIN_DURATION_SECONDS
+    };
+
+    staking_round_next_resolve_time_cache
+        .write()
+        .await
+        .insert(*staking_account_key, next_resolve_time);
+}
+
+pub async fn update_staking_round_next_resolve_time_cache(
+    staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
+    indexed_staking_accounts: &IndexedStakingAccountsThreadSafe,
+) {
+    // For each Staking account, look at when the current staking round ends and set the next resolve time cache to be that time + the minimum round duration (6h)
+    for (staking_account_key, staking_account) in indexed_staking_accounts.read().await.iter() {
+        update_staking_round_next_resolve_time_cache_for_account(
+            staking_round_next_resolve_time_cache,
+            staking_account_key,
+            staking_account,
+        )
+        .await;
+    }
+}
+
+// Update the claim cache with the claim time of the oldest locked stake for each user staking account
+pub async fn update_claim_cache(
+    claim_cache: &UserStakingClaimCacheThreadSafe,
+    indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
+) {
+    for (user_staking_account_key, user_staking_account) in
+        indexed_user_staking_accounts.read().await.iter()
+    {
+        update_claim_cache_for_account(
+            claim_cache,
+            *user_staking_account_key,
+            user_staking_account,
+        )
+        .await;
+    }
+}
+
+/// Update the claim cache with the claim time of the oldest locked stake for a given UserStaking account
+pub async fn update_claim_cache_for_account(
+    claim_cache: &UserStakingClaimCacheThreadSafe,
+    account_key: Pubkey,
+    user_staking_account: &UserStaking,
+) {
+    let oldest_claim_time = user_staking_account
+        .locked_stakes
+        .iter()
+        .filter(|stake| stake.amount != 0)
+        .map(|stake| stake.claim_time)
+        .min();
+    claim_cache
+        .write()
+        .await
+        .insert(account_key, oldest_claim_time);
+}
