@@ -12,6 +12,10 @@ pub async fn resolve_staking_round(
     client: &Client<Arc<Keypair>>,
     median_priority_fee: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
+    log::info!(
+        "  <periodical_resolve_staking_rounds_task> Resolving staking round for staking account {:#?}",
+        staking_account_key
+    );
     let program = client
         .program(adrena_abi::ID)
         .map_err(|e| backoff::Error::transient(e.into()))?;
@@ -69,7 +73,7 @@ pub async fn resolve_staking_round(
         })?;
 
     log::info!(
-        "Resolve staking round for staking account {:#?} - TX sent: {:#?}",
+        "  <periodical_resolve_staking_rounds_task> Resolve staking round for staking account {:#?} - TX sent: {:#?}",
         staking_account_key,
         tx_hash.to_string(),
     );

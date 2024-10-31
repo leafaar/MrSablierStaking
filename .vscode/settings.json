@@ -8,6 +8,8 @@
         "chrono",
         "Datasize",
         "grpf",
+        "logfile",
+        "mrsablierstaking",
         "nonblocking",
         "Oneof",
         "pdas",
@@ -17,6 +19,7 @@
         "pyth",
         "sablier",
         "thiserror",
+        "tspin",
         "Zeroable"
     ]
 }

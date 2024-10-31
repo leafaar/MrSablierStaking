@@ -1,6 +1,6 @@
 use {
     crate::{process_stream_message::process_stream_message, update_caches::update_claim_cache},
-    adrena_abi::{types::Cortex, Staking, UserStaking, ROUND_MIN_DURATION_SECONDS},
+    adrena_abi::{types::Cortex, Staking, UserStaking},
     anchor_client::{solana_sdk::signer::keypair::read_keypair_file, Client, Cluster},
     backoff::{future::retry, ExponentialBackoff},
     clap::Parser,
@@ -56,11 +56,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 5000; // 50th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); // seconds
-// How often does the auto claim task checks for work
-const AUTOCLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
-// How often does the resolve staking round task checks for work
-const RESOLVE_STAKING_ROUND_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
-const AUTOCLAIM_PERIODICITY: Duration = Duration::from_secs(ROUND_MIN_DURATION_SECONDS as u64); // seconds
+                                                                        // How often does the auto claim task checks for work
+                                                                        // const AUTOCLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
+                                                                        //                                                                     // How often does the resolve staking round task checks for work
+                                                                        // const RESOLVE_STAKING_ROUND_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
+                                                                        // const AUTOCLAIM_PERIODICITY: Duration = Duration::from_secs(ROUND_MIN_DURATION_SECONDS as u64); // seconds
 pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 380_000;
 pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
 pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
@@ -85,6 +85,7 @@ impl From<ArgsCommitment> for CommitmentLevel {
         }
     }
 }
+use yellowstone_grpc_proto::prelude::SubscribeRequestPing;
 
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
@@ -343,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
             log::info!("  <> Account filter map initialized");
             let (mut subscribe_tx, mut stream) = {
                 let request = SubscribeRequest {
-                    ping: None,
+                    ping: Some(SubscribeRequestPing { id: 1 }),
                     accounts: accounts_filter_map,
                     commitment: commitment.map(|c| c.into()),
                     ..Default::default()
@@ -426,32 +427,44 @@ async fn main() -> anyhow::Result<()> {
             #[allow(unused_assignments)]
             {
                 let staking_round_next_resolve_time_cache = Arc::clone(&staking_round_next_resolve_time_cache);
-                let indexed_staking_accounts = Arc::clone(&indexed_staking_accounts);
                 let endpoint = args.endpoint.clone();
                 let payer = Arc::clone(&payer);
                 let median_priority_fee = Arc::clone(&median_priority_fee);
                 periodical_resolve_staking_rounds_task = Some({
                     tokio::spawn(async move {
-                        let mut resolve_check_interval = interval(RESOLVE_STAKING_ROUND_CHECK_INTERVAL);
                         let client = Client::new(
                             Cluster::Custom(endpoint.clone(), endpoint.clone()),
                             payer,
                         );
                         loop {
-                            resolve_check_interval.tick().await;
                             let current_time = chrono::Utc::now().timestamp();
                             let cache = staking_round_next_resolve_time_cache.read().await;
-                            
-                            for (staking_account_key, next_resolve_time) in cache.iter() {
-                                if current_time >= *next_resolve_time {
-                                    if let Err(e) = handlers::resolve_staking_round::resolve_staking_round(
-                                        staking_account_key,
-                                        &client,
-                                        *median_priority_fee.lock().await,
-                                    ).await {
-                                        log::error!("Error resolving staking round: {}", e);
+
+                            // Find the next resolve time
+                            let next_resolve_time = cache.values().filter(|&&time| time > current_time).min().cloned();
+
+                            if let Some(next_time) = next_resolve_time {
+                                let interval_duration = Duration::from_secs((next_time - current_time) as u64);
+                                log::info!(
+                                    "  <periodical_resolve_staking_rounds_task> Next resolve staking round in {} seconds. Now sleeping till then...",
+                                    interval_duration.as_secs()
+                                );
+                                tokio::time::sleep(interval_duration).await;
+
+                                for (staking_account_key, next_resolve_time) in cache.iter() {
+                                    if current_time >= *next_resolve_time {
+                                        if let Err(e) = handlers::resolve_staking_round::resolve_staking_round(
+                                            staking_account_key,
+                                            &client,
+                                            *median_priority_fee.lock().await,
+                                        ).await {
+                                            log::error!("Error resolving staking round: {}", e);
+                                        }
                                     }
                                 }
+                            } else {
+                                // If no future resolve time is found, wait for a default duration
+                                tokio::time::sleep(Duration::from_secs(30)).await;
                             }
                         }
                     })
