@@ -24,7 +24,7 @@ pub async fn claim_stakes(
         staked_token_mint
     );
     let transfer_authority_pda = get_transfer_authority_pda().0;
-    let staking_pda = get_staking_pda(&staked_token_mint).0;
+    let staking_pda = get_staking_pda(staked_token_mint).0;
 
     let staking_reward_token_vault_pda = get_staking_reward_token_vault_pda(&staking_pda).0;
     let staking_lm_reward_token_vault_pda = get_staking_lm_reward_token_vault_pda(&staking_pda).0;
@@ -34,7 +34,7 @@ pub async fn claim_stakes(
         owner_pubkey,
         transfer_authority_pda,
         &staking_pda,
-        &user_staking_account_key,
+        user_staking_account_key,
         &staking_reward_token_vault_pda,
         &staking_lm_reward_token_vault_pda,
     );

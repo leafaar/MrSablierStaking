@@ -1,10 +1,14 @@
 use {
     crate::{process_stream_message::process_stream_message, update_caches::update_claim_cache},
-    adrena_abi::{Staking, UserStaking, ROUND_MIN_DURATION_SECONDS},
+    adrena_abi::{
+        Staking, StakingType, UserStaking, ADX_MINT, ALP_MINT, ROUND_MIN_DURATION_SECONDS,
+    },
     anchor_client::{solana_sdk::signer::keypair::read_keypair_file, Client, Cluster, Program},
     backoff::{future::retry, ExponentialBackoff},
     clap::Parser,
     futures::{StreamExt, TryFutureExt},
+    openssl::ssl::{SslConnector, SslMethod},
+    postgres_openssl::MakeTlsConnector,
     priority_fees::fetch_mean_priority_fee,
     solana_client::rpc_filter::{Memcmp, RpcFilterType},
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
@@ -28,10 +32,7 @@ use {
             CommitmentLevel, SubscribeRequestFilterAccounts,
         },
     },
-};use adrena_abi::{StakingType, ADX_MINT, ALP_MINT};
-
-use openssl::ssl::{SslConnector, SslMethod};
-use postgres_openssl::MakeTlsConnector;
+};
 
 type AccountFilterMap = HashMap<String, SubscribeRequestFilterAccounts>;
 
@@ -54,7 +55,7 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 5000; // 50th
-const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); 
+const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 380_000;
 pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
 pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
@@ -64,7 +65,7 @@ pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
 pub const CLAIM_STAKES_CU_LIMIT: u32 = 400_000;
 
 // The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
-pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25; 
+pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25;
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -449,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // Process any claim stakes tasks
                 log::info!("6 - Process any claim stakes tasks...");
-                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;   
+                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;
             }
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
@@ -459,7 +460,6 @@ async fn main() -> anyhow::Result<()> {
     .await
     .map_err(Into::into)
 }
-
 
 async fn process_resolve_staking_rounds(
     staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
@@ -473,7 +473,7 @@ async fn process_resolve_staking_rounds(
         if current_time >= *next_resolve_time {
             if let Err(e) = handlers::resolve_staking_round::resolve_staking_round(
                 staking_account_key,
-                &program,
+                program,
                 median_priority_fee,
             )
             .await
@@ -494,14 +494,17 @@ pub async fn process_claim_stakes(
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     let current_time = chrono::Utc::now().timestamp();
     let claim_cache = claim_cache.read().await;
-    for (user_staking_account_key, last_claim_time) in claim_cache.iter().filter(|(_, last_claim_time)| last_claim_time.is_some()) {
+    for (user_staking_account_key, last_claim_time) in claim_cache
+        .iter()
+        .filter(|(_, last_claim_time)| last_claim_time.is_some())
+    {
         if current_time >= last_claim_time.unwrap() + AUTO_CLAIM_THRESHOLD_SECONDS {
             // retrieve the owner of the UserStaking account
             let owner_pubkey = {
                 let rows = db
                     .query("SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT", &[&user_staking_account_key.to_string()])
                     .await.map_err(|e| backoff::Error::transient(e.into()))?;
-                
+
                 let row = rows.first().expect("No row for user staking account");
                 Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
             };
@@ -513,15 +516,21 @@ pub async fn process_claim_stakes(
                 .expect("UserStaking account not found in the indexed user staking accounts");
 
             // Retrieve the staked token mint - Which might not be defined for some account as it was a late addition to the program.
-            let staked_token_mint =  match user_staking_account.get_staking_type() {
+            let staked_token_mint = match user_staking_account.get_staking_type() {
                 StakingType::LM => ADX_MINT,
                 StakingType::LP => ALP_MINT,
             };
 
             // Do a claim stake for the UserStaking account if we have a staked token mint
-            handlers::claim_stakes(user_staking_account_key, &owner_pubkey, &program, median_priority_fee, &staked_token_mint)
-                .await
-                .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+            handlers::claim_stakes(
+                user_staking_account_key,
+                &owner_pubkey,
+                program,
+                median_priority_fee,
+                &staked_token_mint,
+            )
+            .await
+            .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
         }
     }
     Ok(())

@@ -68,7 +68,7 @@ where
                             StakingAccountUpdate::Modified(updated_staking_account) => {
                                 // Based on the updated Staking account, update the staking round next resolve time cache (if needed)
                                 update_staking_round_next_resolve_time_cache_for_account(
-                                    &staking_round_next_resolve_time_cache,
+                                    staking_round_next_resolve_time_cache,
                                     &account_key,
                                     &updated_staking_account,
                                 )
