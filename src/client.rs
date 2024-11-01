@@ -444,6 +444,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // The methods below are evaluated each time a message is processed form the stream (and that also happen periodically through the ping)
+
                 // Process any resolve staking round tasks
                 log::info!("5 - Process any resolve staking round tasks...");
                 process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee.lock().await).await?;
