@@ -60,6 +60,12 @@ pub async fn update_indexed_user_staking_accounts(
     let user_staking_account = UserStaking::try_deserialize(&mut &user_staking_account_data[..])
         .map_err(|e| backoff::Error::transient(e.into()))?;
 
+    if user_staking_account.staking_type == 0 {
+        return Ok(UserStakingAccountUpdate::MissingStakingType(
+            user_staking_account,
+        ));
+    }
+
     let is_new_user_staking_account = user_staking_accounts
         .insert(*user_staking_account_key, user_staking_account)
         .is_none();

@@ -1,14 +1,14 @@
 use {
     crate::{process_stream_message::process_stream_message, update_caches::update_claim_cache},
-    adrena_abi::{types::Cortex, Staking, UserStaking},
-    anchor_client::{solana_sdk::signer::keypair::read_keypair_file, Client, Cluster},
+    adrena_abi::{Staking, UserStaking, ROUND_MIN_DURATION_SECONDS},
+    anchor_client::{solana_sdk::signer::keypair::read_keypair_file, Client, Cluster, Program},
     backoff::{future::retry, ExponentialBackoff},
     clap::Parser,
     futures::{StreamExt, TryFutureExt},
     priority_fees::fetch_mean_priority_fee,
     solana_client::rpc_filter::{Memcmp, RpcFilterType},
-    solana_sdk::pubkey::Pubkey,
-    std::{collections::HashMap, env, sync::Arc, time::Duration},
+    solana_sdk::{pubkey::Pubkey, signature::Keypair},
+    std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration},
     tokio::{
         sync::{Mutex, RwLock},
         task::JoinHandle,
@@ -28,7 +28,10 @@ use {
             CommitmentLevel, SubscribeRequestFilterAccounts,
         },
     },
-};
+};use adrena_abi::{StakingType, ADX_MINT, ALP_MINT};
+
+use openssl::ssl::{SslConnector, SslMethod};
+use postgres_openssl::MakeTlsConnector;
 
 type AccountFilterMap = HashMap<String, SubscribeRequestFilterAccounts>;
 
@@ -40,10 +43,6 @@ type UserStakingClaimCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, Option<i64>>>>
 // Cache the time of next execution for the resolve staking round task, keyed by Staking account pda
 type StakingRoundNextResolveTimeCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, i64>>>;
 
-// https://solscan.io/account/rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ
-pub const PYTH_RECEIVER_PROGRAM: &str = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
-
-pub mod evaluate_and_run_automated_orders;
 pub mod handlers;
 pub mod priority_fees;
 pub mod process_stream_message;
@@ -55,18 +54,17 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 5000; // 50th
-const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); // seconds
-                                                                        // How often does the auto claim task checks for work
-                                                                        // const AUTOCLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
-                                                                        //                                                                     // How often does the resolve staking round task checks for work
-                                                                        // const RESOLVE_STAKING_ROUND_CHECK_INTERVAL: Duration = Duration::from_secs(30); // seconds
-                                                                        // const AUTOCLAIM_PERIODICITY: Duration = Duration::from_secs(ROUND_MIN_DURATION_SECONDS as u64); // seconds
+const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5); 
 pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 380_000;
 pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
 pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
 pub const LIQUIDATE_LONG_CU_LIMIT: u32 = 310_000;
 pub const LIQUIDATE_SHORT_CU_LIMIT: u32 = 210_000;
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
+pub const CLAIM_STAKES_CU_LIMIT: u32 = 400_000;
+
+// The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
+pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25; 
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -85,7 +83,6 @@ impl From<ArgsCommitment> for CommitmentLevel {
         }
     }
 }
-use yellowstone_grpc_proto::prelude::SubscribeRequestPing;
 
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
@@ -104,6 +101,10 @@ struct Args {
     /// Path to the payer keypair
     #[clap(long)]
     payer_keypair: String,
+
+    /// DB Url
+    #[clap(long)]
+    db_string: String,
 }
 
 impl Args {
@@ -232,18 +233,22 @@ async fn main() -> anyhow::Result<()> {
         let claim_cache = Arc::clone(&claim_cache);
         let staking_round_next_resolve_time_cache = Arc::clone(&staking_round_next_resolve_time_cache);
         let mut periodical_priority_fees_fetching_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
-        // let mut periodical_claim_stakes_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
+        let mut periodical_claim_stakes_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
         let mut periodical_resolve_staking_rounds_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
+        let mut db_connection_task: Option<JoinHandle<()>> = None;
 
         async move {
             // In case it errored out, abort the fee task (will be recreated)
             if let Some(t) = periodical_priority_fees_fetching_task.take() {
                 t.abort();
             }
-            // if let Some(t) = periodical_claim_stakes_task.take() {
-            //     t.abort();
-            // }
+            if let Some(t) = periodical_claim_stakes_task.take() {
+                t.abort();
+            }
             if let Some(t) = periodical_resolve_staking_rounds_task.take() {
+                t.abort();
+            }
+            if let Some(t) = db_connection_task.take() {
                 t.abort();
             }
 
@@ -272,11 +277,20 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| backoff::Error::transient(e.into()))?;
             log::info!("  <> gRPC, RPC clients connected!");
 
-            // Fetched once
-            let cortex: Cortex = program
-                .account::<Cortex>(adrena_abi::CORTEX_ID)
-                .await
-                .map_err(|e| backoff::Error::transient(e.into()))?;
+            // Connect to the DB that contains the table matching the UserStaking accounts to their owners (the onchain data doesn't contain the owner)
+            // Create an SSL connector
+            let builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            let connector = MakeTlsConnector::new(builder.build());
+            let (db, db_connection) = tokio_postgres::connect(&args.db_string, connector).await.map_err(|e| backoff::Error::transient(e.into()))?;
+            // Open a connection to the DB
+            #[allow(unused_assignments)]
+            {
+                db_connection_task = Some(tokio::spawn(async move {
+                    if let Err(e) = db_connection.await {
+                        log::error!("connection error: {}", e);
+                    }
+                }));
+            }
 
             // ////////////////////////////////////////////////////////////////
             log::info!("1 - Retrieving and indexing all Staking andUserStaking accounts...");
@@ -317,7 +331,12 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let mut indexed_user_staking_accounts = indexed_user_staking_accounts.write().await;
 
-                        indexed_user_staking_accounts.extend(existing_user_staking_accounts);
+                        // filter out the accounts that have no staking type defined yet
+                        let existing_user_staking_accounts_len = existing_user_staking_accounts.len();
+                        let existing_user_staking_accounts_with_staking_type: HashMap<Pubkey, UserStaking> = existing_user_staking_accounts.into_iter().filter(|a| a.1.staking_type != 0).collect();
+                        log::info!("  <> # of existing UserStaking accounts w/o staking type defined filtered out: {}", existing_user_staking_accounts_len - existing_user_staking_accounts_with_staking_type.len());
+
+                        indexed_user_staking_accounts.extend(existing_user_staking_accounts_with_staking_type);
                     }
                     log::info!(
                         "  <> # of existing UserStaking accounts parsed and loaded: {}",
@@ -344,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
             log::info!("  <> Account filter map initialized");
             let (mut subscribe_tx, mut stream) = {
                 let request = SubscribeRequest {
-                    ping: Some(SubscribeRequestPing { id: 1 }),
+                    ping: None,// Some(SubscribeRequestPing { id: 1 }),
                     accounts: accounts_filter_map,
                     commitment: commitment.map(|c| c.into()),
                     ..Default::default()
@@ -389,89 +408,6 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // ////////////////////////////////////////////////////////////////
-            // Side thread that decide when to claim stakes from UserStaking accounts
-            // based on the claim cache
-            // ////////////////////////////////////////////////////////////////
-            // log::info!("4 - Spawn a task to claim stakes from UserStaking accounts...");
-            // #[allow(unused_assignments)]
-            // {
-            // let claim_cache = Arc::clone(&claim_cache);
-            // periodical_claim_stakes_task = Some({
-            //     tokio::spawn(async move {
-            //         // Will check every 60 seconds if there are any UserStaking accounts that need to have stakes claimed
-            //         let mut claim_check_interval = interval(AUTOCLAIM_CHECK_INTERVAL);
-            //         loop {
-            //             claim_check_interval.tick().await;
-            //             let current_time = chrono::Utc::now().timestamp();
-
-            //             let claim_cache = claim_cache.read().await;
-            //             for (user_staking_account_key, last_claim_time) in claim_cache.iter().filter(|(_, last_claim_time)| last_claim_time.is_some()) {
-            //                 if current_time >= last_claim_time.unwrap() + ROUND_MIN_DURATION_SECONDS {
-            //                     // Do a claim stake for all the stakes in the UserStaking account -- we are missing the owner. fuck
-            //                     // Update the claim cache with the new last claim time
-            //                 }
-            //             }
-            //         }
-            //         })
-            //     });
-            // }
-
-            // ////////////////////////////////////////////////////////////////
-            // Side thread that decide when to claim stakes from UserStaking accounts
-            // based on the claim cache
-            // ////////////////////////////////////////////////////////////////
-            // ////////////////////////////////////////////////////////////////
-            // Side thread that resolves staking rounds based on the next resolve time cache
-            // ////////////////////////////////////////////////////////////////
-            log::info!("4 - Spawn a task to resolve staking rounds...");
-            #[allow(unused_assignments)]
-            {
-                let staking_round_next_resolve_time_cache = Arc::clone(&staking_round_next_resolve_time_cache);
-                let endpoint = args.endpoint.clone();
-                let payer = Arc::clone(&payer);
-                let median_priority_fee = Arc::clone(&median_priority_fee);
-                periodical_resolve_staking_rounds_task = Some({
-                    tokio::spawn(async move {
-                        let client = Client::new(
-                            Cluster::Custom(endpoint.clone(), endpoint.clone()),
-                            payer,
-                        );
-                        loop {
-                            let current_time = chrono::Utc::now().timestamp();
-                            let cache = staking_round_next_resolve_time_cache.read().await;
-
-                            // Find the next resolve time
-                            let next_resolve_time = cache.values().filter(|&&time| time > current_time).min().cloned();
-
-                            if let Some(next_time) = next_resolve_time {
-                                let interval_duration = Duration::from_secs((next_time - current_time) as u64);
-                                log::info!(
-                                    "  <periodical_resolve_staking_rounds_task> Next resolve staking round in {} seconds. Now sleeping till then...",
-                                    interval_duration.as_secs()
-                                );
-                                tokio::time::sleep(interval_duration).await;
-
-                                for (staking_account_key, next_resolve_time) in cache.iter() {
-                                    if current_time >= *next_resolve_time {
-                                        if let Err(e) = handlers::resolve_staking_round::resolve_staking_round(
-                                            staking_account_key,
-                                            &client,
-                                            *median_priority_fee.lock().await,
-                                        ).await {
-                                            log::error!("Error resolving staking round: {}", e);
-                                        }
-                                    }
-                                }
-                            } else {
-                                // If no future resolve time is found, wait for a default duration
-                                tokio::time::sleep(Duration::from_secs(30)).await;
-                            }
-                        }
-                    })
-                });
-            }
-
-            // ////////////////////////////////////////////////////////////////
             // CORE LOOP
             //
             // Here we wait for new messages from the stream and process them
@@ -481,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
             // ////////////////////////////////////////////////////////////////
             log::info!("4 - Start core loop: processing gRPC stream...");
             loop {
+                // Process any stream messages
                 if let Some(message) = stream.next().await {
                     match process_stream_message(
                         message.map_err(|e| backoff::Error::transient(e.into())),
@@ -488,15 +425,13 @@ async fn main() -> anyhow::Result<()> {
                         &indexed_user_staking_accounts,
                         &claim_cache,
                         &staking_round_next_resolve_time_cache,
-                        &payer,
-                        &args.endpoint.clone(),
-                        &cortex,
                         &mut subscribe_tx,
-                        *median_priority_fee.lock().await,
                     )
                     .await
                     {
-                        Ok(_) => continue,
+                        Ok(_) => {
+                            // Stream message processed successfully - onward with the loop
+                        },
                         Err(backoff::Error::Permanent(e)) => {
                             log::error!("Permanent error: {:?}", e);
                             break;
@@ -507,9 +442,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-            }
 
-            // log::info!("  <> stream closed");
+                // Process any resolve staking round tasks
+                log::info!("5 - Process any resolve staking round tasks...");
+                process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee.lock().await).await?;
+
+                // Process any claim stakes tasks
+                log::info!("6 - Process any claim stakes tasks...");
+                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;   
+            }
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
         }
@@ -517,4 +458,71 @@ async fn main() -> anyhow::Result<()> {
     })
     .await
     .map_err(Into::into)
+}
+
+
+async fn process_resolve_staking_rounds(
+    staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
+    program: &Program<Arc<Keypair>>,
+    median_priority_fee: u64,
+) -> Result<(), backoff::Error<anyhow::Error>> {
+    let current_time = chrono::Utc::now().timestamp();
+    let cache = staking_round_next_resolve_time_cache.read().await;
+
+    for (staking_account_key, next_resolve_time) in cache.iter() {
+        if current_time >= *next_resolve_time {
+            if let Err(e) = handlers::resolve_staking_round::resolve_staking_round(
+                staking_account_key,
+                &program,
+                median_priority_fee,
+            )
+            .await
+            {
+                log::error!("Error resolving staking round: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn process_claim_stakes(
+    claim_cache: &UserStakingClaimCacheThreadSafe,
+    db: &tokio_postgres::Client,
+    indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
+    program: &Program<Arc<Keypair>>,
+    median_priority_fee: u64,
+) -> Result<(), backoff::Error<anyhow::Error>> {
+    let current_time = chrono::Utc::now().timestamp();
+    let claim_cache = claim_cache.read().await;
+    for (user_staking_account_key, last_claim_time) in claim_cache.iter().filter(|(_, last_claim_time)| last_claim_time.is_some()) {
+        if current_time >= last_claim_time.unwrap() + AUTO_CLAIM_THRESHOLD_SECONDS {
+            // retrieve the owner of the UserStaking account
+            let owner_pubkey = {
+                let rows = db
+                    .query("SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT", &[&user_staking_account_key.to_string()])
+                    .await.map_err(|e| backoff::Error::transient(e.into()))?;
+                
+                let row = rows.first().expect("No row for user staking account");
+                Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
+            };
+
+            // Retrieve the UserStaking account
+            let indexed_user_staking_accounts_read = indexed_user_staking_accounts.read().await;
+            let user_staking_account = indexed_user_staking_accounts_read
+                .get(user_staking_account_key)
+                .expect("UserStaking account not found in the indexed user staking accounts");
+
+            // Retrieve the staked token mint - Which might not be defined for some account as it was a late addition to the program.
+            let staked_token_mint =  match user_staking_account.get_staking_type() {
+                StakingType::LM => ADX_MINT,
+                StakingType::LP => ALP_MINT,
+            };
+
+            // Do a claim stake for the UserStaking account if we have a staked token mint
+            handlers::claim_stakes(user_staking_account_key, &owner_pubkey, &program, median_priority_fee, &staked_token_mint)
+                .await
+                .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+        }
+    }
+    Ok(())
 }

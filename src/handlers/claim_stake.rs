@@ -1,40 +1,43 @@
 use {
-    crate::{handlers::create_resolve_staking_round_ix, RESOLVE_STAKING_ROUND_CU_LIMIT},
-    adrena_abi::get_transfer_authority_pda,
+    crate::{handlers::create_claim_stakes_ix, CLAIM_STAKES_CU_LIMIT},
+    adrena_abi::{
+        get_staking_lm_reward_token_vault_pda, get_staking_pda, get_staking_reward_token_vault_pda,
+        get_transfer_authority_pda,
+    },
     anchor_client::Program,
     solana_client::rpc_config::RpcSendTransactionConfig,
     solana_sdk::{compute_budget::ComputeBudgetInstruction, pubkey::Pubkey, signature::Keypair},
     std::sync::Arc,
 };
 
-pub async fn resolve_staking_round(
-    staking_account_key: &Pubkey,
+pub async fn claim_stakes(
+    user_staking_account_key: &Pubkey,
+    owner_pubkey: &Pubkey,
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
+    staked_token_mint: &Pubkey,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
-        "  <> Resolving staking round for staking account {:#?}",
-        staking_account_key
+        "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+        user_staking_account_key,
+        owner_pubkey,
+        staked_token_mint
     );
-
-
     let transfer_authority_pda = get_transfer_authority_pda().0;
-    let staking_staked_token_vault_pda =
-        adrena_abi::pda::get_staking_staked_token_vault_pda(staking_account_key).0;
-    let staking_reward_token_vault_pda =
-        adrena_abi::pda::get_staking_reward_token_vault_pda(staking_account_key).0;
-    let staking_lm_reward_token_vault_pda =
-        adrena_abi::pda::get_staking_lm_reward_token_vault_pda(staking_account_key).0;
+    let staking_pda = get_staking_pda(&staked_token_mint).0;
 
-    let (resolve_staking_round_params, resolve_staking_round_accounts) =
-        create_resolve_staking_round_ix(
-            &program.payer(),
-            transfer_authority_pda,
-            staking_account_key,
-            &staking_staked_token_vault_pda,
-            &staking_reward_token_vault_pda,
-            &staking_lm_reward_token_vault_pda,
-        );
+    let staking_reward_token_vault_pda = get_staking_reward_token_vault_pda(&staking_pda).0;
+    let staking_lm_reward_token_vault_pda = get_staking_lm_reward_token_vault_pda(&staking_pda).0;
+
+    let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
+        &program.payer(),
+        owner_pubkey,
+        transfer_authority_pda,
+        &staking_pda,
+        &user_staking_account_key,
+        &staking_reward_token_vault_pda,
+        &staking_lm_reward_token_vault_pda,
+    );
 
     let tx = program
         .request()
@@ -42,10 +45,10 @@ pub async fn resolve_staking_round(
             median_priority_fee,
         ))
         .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
-            RESOLVE_STAKING_ROUND_CU_LIMIT,
+            CLAIM_STAKES_CU_LIMIT,
         ))
-        .args(resolve_staking_round_params)
-        .accounts(resolve_staking_round_accounts)
+        .args(claim_stakes_params)
+        .accounts(claim_stakes_accounts)
         .signed_transaction()
         .await
         .map_err(|e| {
@@ -71,8 +74,8 @@ pub async fn resolve_staking_round(
         })?;
 
     log::info!(
-        "  <> Resolve staking round for staking account {:#?} - TX sent: {:#?}",
-        staking_account_key,
+        "  <> Claim stakes for staking account {:#?} - TX sent: {:#?}",
+        user_staking_account_key,
         tx_hash.to_string(),
     );
 

@@ -9,10 +9,9 @@ use {
         IndexedStakingAccountsThreadSafe, IndexedUserStakingAccountsThreadSafe,
         StakingRoundNextResolveTimeCacheThreadSafe, UserStakingClaimCacheThreadSafe,
     },
-    adrena_abi::{types::Cortex, Staking, UserStaking},
+    adrena_abi::{Staking, UserStaking},
     futures::{channel::mpsc::SendError, Sink, SinkExt},
-    solana_sdk::{pubkey::Pubkey, signature::Keypair},
-    std::sync::Arc,
+    solana_sdk::pubkey::Pubkey,
     yellowstone_grpc_proto::geyser::{
         subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing, SubscribeUpdate,
     },
@@ -28,6 +27,7 @@ pub enum UserStakingAccountUpdate {
     Created(UserStaking),
     Modified(UserStaking),
     Closed,
+    MissingStakingType(UserStaking),
 }
 
 pub async fn process_stream_message<S>(
@@ -36,11 +36,7 @@ pub async fn process_stream_message<S>(
     indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
     claim_cache: &UserStakingClaimCacheThreadSafe,
     staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
-    _payer: &Arc<Keypair>,
-    _endpoint: &str,
-    _cortex: &Cortex,
     subscribe_tx: &mut S,
-    _median_priority_fee: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>>
 where
     S: Sink<SubscribeRequest, Error = SendError> + Unpin,
@@ -128,6 +124,12 @@ where
                                 )
                                 .await;
                             }
+                            UserStakingAccountUpdate::MissingStakingType(_) => {
+                                log::info!(
+                                    "(pcu) UserStaking account missing staking type has been updated (did nothing): {:#?}",
+                                    account_key
+                                );
+                            }
                             UserStakingAccountUpdate::Closed => {
                                 log::info!("(pcu) UserStaking account closed: {:#?}", account_key);
                                 // We need to remove the closed UserStaking account from the claim cache
@@ -154,7 +156,8 @@ where
                             UserStakingAccountUpdate::Modified(_) => {
                                 panic!("UserStaking account modified in positions_close filter");
                             }
-                            UserStakingAccountUpdate::Closed => {
+                            UserStakingAccountUpdate::Closed
+                            | UserStakingAccountUpdate::MissingStakingType(_) => {
                                 log::info!("(pc) UserStaking account closed: {:#?}", account_key);
                                 // We need to update the subscriptions request to remove the closed UserStaking account
                                 subscriptions_update_required = true;
