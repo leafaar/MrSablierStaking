@@ -507,17 +507,18 @@ pub async fn process_claim_stakes(
                     .query("SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT", &[&user_staking_account_key.to_string()])
                     .await.map_err(|e| backoff::Error::transient(e.into()))?;
 
-                let row = match rows.first() {
-                    Some(row) => row,
+                match rows.first() {
+                    Some(row) => {
+                        Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
+                    }
                     None => {
-                        log::error!(
-                            "No row found for user staking account {:#?}",
+                        log::warn!(
+                            "No owner found in DB for UserStaking account: {} - Skipping claim",
                             user_staking_account_key
                         );
-                        return Err(backoff::Error::transient(anyhow::anyhow!("No row found")));
+                        continue; // Skip this item
                     }
-                };
-                Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
+                }
             };
 
             // Retrieve the UserStaking account
