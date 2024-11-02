@@ -66,6 +66,7 @@ where
                                 panic!("Staking account created in staking_create_update filter");
                             }
                             StakingAccountUpdate::Modified(updated_staking_account) => {
+                                log::info!("(scu) Staking account modified: {:#?}", account_key);
                                 // Based on the updated Staking account, update the staking round next resolve time cache (if needed)
                                 update_staking_round_next_resolve_time_cache_for_account(
                                     staking_round_next_resolve_time_cache,

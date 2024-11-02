@@ -447,12 +447,12 @@ async fn main() -> anyhow::Result<()> {
                 // The methods below are evaluated each time a message is processed form the stream (and that also happen periodically through the ping)
 
                 // Process any resolve staking round tasks
-                log::info!("5 - Process any resolve staking round tasks...");
                 process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee.lock().await).await?;
 
                 // Process any claim stakes tasks
-                log::info!("6 - Process any claim stakes tasks...");
                 process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;
+
+                // Process 
             }
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
@@ -507,7 +507,16 @@ pub async fn process_claim_stakes(
                     .query("SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT", &[&user_staking_account_key.to_string()])
                     .await.map_err(|e| backoff::Error::transient(e.into()))?;
 
-                let row = rows.first().expect("No row for user staking account");
+                let row = match rows.first() {
+                    Some(row) => row,
+                    None => {
+                        log::error!(
+                            "No row found for user staking account {:#?}",
+                            user_staking_account_key
+                        );
+                        return Err(backoff::Error::transient(anyhow::anyhow!("No row found")));
+                    }
+                };
                 Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
             };
 
