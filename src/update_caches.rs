@@ -1,9 +1,11 @@
 use {
     crate::{
-        IndexedStakingAccountsThreadSafe, IndexedUserStakingAccountsThreadSafe,
-        StakingRoundNextResolveTimeCacheThreadSafe, UserStakingClaimCacheThreadSafe,
+        FinalizeLockedStakesCacheThreadSafe, IndexedStakingAccountsThreadSafe,
+        IndexedUserStakingAccountsThreadSafe, StakingRoundNextResolveTimeCacheThreadSafe,
+        UserStakingClaimCacheThreadSafe,
     },
     adrena_abi::{Pubkey, Staking, UserStaking, ROUND_MIN_DURATION_SECONDS},
+    std::collections::HashMap,
 };
 
 pub async fn update_staking_round_next_resolve_time_cache_for_account(
@@ -75,4 +77,37 @@ pub async fn update_claim_cache_for_account(
         .write()
         .await
         .insert(account_key, oldest_claim_time);
+}
+
+pub async fn update_finalize_locked_stakes_cache(
+    finalize_locked_stakes_cache: &FinalizeLockedStakesCacheThreadSafe,
+    indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
+) {
+    for (user_staking_account_key, user_staking_account) in
+        indexed_user_staking_accounts.read().await.iter()
+    {
+        update_finalize_locked_stakes_cache_for_account(
+            finalize_locked_stakes_cache,
+            user_staking_account_key,
+            user_staking_account,
+        )
+        .await;
+    }
+}
+
+pub async fn update_finalize_locked_stakes_cache_for_account(
+    finalize_locked_stakes_cache: &FinalizeLockedStakesCacheThreadSafe,
+    user_staking_account_key: &Pubkey,
+    user_staking_account: &UserStaking,
+) {
+    for ls in user_staking_account.locked_stakes.iter() {
+        if ls.amount != 0 {
+            finalize_locked_stakes_cache
+                .write()
+                .await
+                .entry(*user_staking_account_key)
+                .or_insert_with(HashMap::new)
+                .insert(ls.stake_resolution_thread_id, ls.end_time);
+        }
+    }
 }

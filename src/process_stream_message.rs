@@ -2,12 +2,13 @@ use {
     crate::{
         generate_accounts_filter_map,
         update_caches::{
-            update_claim_cache_for_account,
+            update_claim_cache_for_account, update_finalize_locked_stakes_cache_for_account,
             update_staking_round_next_resolve_time_cache_for_account,
         },
         update_indexes::{update_indexed_staking_accounts, update_indexed_user_staking_accounts},
-        IndexedStakingAccountsThreadSafe, IndexedUserStakingAccountsThreadSafe,
-        StakingRoundNextResolveTimeCacheThreadSafe, UserStakingClaimCacheThreadSafe,
+        FinalizeLockedStakesCacheThreadSafe, IndexedStakingAccountsThreadSafe,
+        IndexedUserStakingAccountsThreadSafe, StakingRoundNextResolveTimeCacheThreadSafe,
+        UserStakingClaimCacheThreadSafe,
     },
     adrena_abi::{Staking, UserStaking},
     futures::{channel::mpsc::SendError, Sink, SinkExt},
@@ -35,6 +36,7 @@ pub async fn process_stream_message<S>(
     indexed_staking_accounts: &IndexedStakingAccountsThreadSafe,
     indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
     claim_cache: &UserStakingClaimCacheThreadSafe,
+    finalize_locked_stakes_cache: &FinalizeLockedStakesCacheThreadSafe,
     staking_round_next_resolve_time_cache: &StakingRoundNextResolveTimeCacheThreadSafe,
     subscribe_tx: &mut S,
 ) -> Result<(), backoff::Error<anyhow::Error>>
@@ -105,6 +107,14 @@ where
                                 update_claim_cache_for_account(
                                     claim_cache,
                                     account_key,
+                                    &new_user_staking_account,
+                                )
+                                .await;
+
+                                // Update the finalize locked stakes cache with the locked stakes for the new UserStaking account
+                                update_finalize_locked_stakes_cache_for_account(
+                                    finalize_locked_stakes_cache,
+                                    &account_key,
                                     &new_user_staking_account,
                                 )
                                 .await;
