@@ -19,7 +19,9 @@ use {
         time::interval,
     },
     tonic::transport::channel::ClientTlsConfig,
-    update_caches::update_staking_round_next_resolve_time_cache,
+    update_caches::{
+        update_finalize_locked_stakes_cache, update_staking_round_next_resolve_time_cache,
+    },
     yellowstone_grpc_client::{GeyserGrpcClient, Interceptor},
     yellowstone_grpc_proto::{
         geyser::{
@@ -43,6 +45,8 @@ type IndexedUserStakingAccountsThreadSafe = Arc<RwLock<HashMap<Pubkey, UserStaki
 type UserStakingClaimCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, Option<i64>>>>;
 // Cache the time of next execution for the resolve staking round task, keyed by Staking account pda
 type StakingRoundNextResolveTimeCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, i64>>>;
+// Cache the list of UserStaking accounts and their stake resolution threads ids / time at which it may be finalized
+type FinalizeLockedStakesCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, HashMap<u64, i64>>>>;
 
 pub mod handlers;
 pub mod priority_fees;
@@ -222,6 +226,8 @@ async fn main() -> anyhow::Result<()> {
     let claim_cache: UserStakingClaimCacheThreadSafe = Arc::new(RwLock::new(HashMap::new()));
     let staking_round_next_resolve_time_cache: StakingRoundNextResolveTimeCacheThreadSafe =
         Arc::new(RwLock::new(HashMap::new()));
+    let finalize_locked_stakes_cache: FinalizeLockedStakesCacheThreadSafe =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // The default exponential backoff strategy intervals:
     // [500ms, 750ms, 1.125s, 1.6875s, 2.53125s, 3.796875s, 5.6953125s,
@@ -233,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         let indexed_user_staking_accounts = Arc::clone(&indexed_user_staking_accounts);
         let claim_cache = Arc::clone(&claim_cache);
         let staking_round_next_resolve_time_cache = Arc::clone(&staking_round_next_resolve_time_cache);
+        let finalize_locked_stakes_cache = Arc::clone(&finalize_locked_stakes_cache);
         let mut periodical_priority_fees_fetching_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
         let mut periodical_claim_stakes_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
         let mut periodical_resolve_staking_rounds_task: Option<JoinHandle<Result<(), backoff::Error<anyhow::Error>>>> = None;
@@ -351,6 +358,9 @@ async fn main() -> anyhow::Result<()> {
                 // Update for current UserStaking accounts
                 update_claim_cache(&claim_cache, &indexed_user_staking_accounts).await;
 
+                // Update for current UserStaking accounts that need to be finalized
+                update_finalize_locked_stakes_cache(&finalize_locked_stakes_cache, &indexed_user_staking_accounts).await;
+
             }
             // ////////////////////////////////////////////////////////////////
 
@@ -425,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
                         &indexed_staking_accounts,
                         &indexed_user_staking_accounts,
                         &claim_cache,
+                        &finalize_locked_stakes_cache,
                         &staking_round_next_resolve_time_cache,
                         &mut subscribe_tx,
                     )
@@ -447,12 +458,19 @@ async fn main() -> anyhow::Result<()> {
                 // The methods below are evaluated each time a message is processed form the stream (and that also happen periodically through the ping)
 
                 // Process any resolve staking round tasks
-                log::info!("5 - Process any resolve staking round tasks...");
+                // let start = std::time::Instant::now();
                 process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee.lock().await).await?;
+                // log::info!("process_resolve_staking_rounds took {:?}", start.elapsed());
 
                 // Process any claim stakes tasks
-                log::info!("6 - Process any claim stakes tasks...");
+                // let start = std::time::Instant::now();
                 process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;
+                // log::info!("process_claim_stakes took {:?}", start.elapsed());
+
+                // Process finalize locked stakes tasks
+                // let start = std::time::Instant::now();
+                process_finalize_locked_stakes(&finalize_locked_stakes_cache, &indexed_user_staking_accounts, &db, &program, *median_priority_fee.lock().await).await?;
+                // log::info!("process_finalize_locked_stakes took {:?}", start.elapsed());
             }
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
@@ -502,48 +520,103 @@ pub async fn process_claim_stakes(
     {
         if current_time >= last_claim_time.unwrap() + AUTO_CLAIM_THRESHOLD_SECONDS {
             // retrieve the owner of the UserStaking account
-            let owner_pubkey = {
-                let rows = db
-                    .query("SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT", &[&user_staking_account_key.to_string()])
-                    .await.map_err(|e| backoff::Error::transient(e.into()))?;
+            if let Some(owner_pubkey) = get_owner_pubkey(db, user_staking_account_key).await? {
+                // Retrieve the UserStaking account
+                let indexed_user_staking_accounts_read = indexed_user_staking_accounts.read().await;
+                let user_staking_account = indexed_user_staking_accounts_read
+                    .get(user_staking_account_key)
+                    .expect("UserStaking account not found in the indexed user staking accounts");
 
-                match rows.first() {
-                    Some(row) => {
-                        Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey")
-                    }
-                    None => {
-                        log::warn!(
-                            "No owner found in DB for UserStaking account: {} - Skipping claim",
-                            user_staking_account_key
-                        );
-                        continue; // Skip this item
-                    }
-                }
-            };
+                // Retrieve the staked token mint - Which might not be defined for some account as it was a late addition to the program.
+                let staked_token_mint = match user_staking_account.get_staking_type() {
+                    StakingType::LM => ADX_MINT,
+                    StakingType::LP => ALP_MINT,
+                };
 
-            // Retrieve the UserStaking account
-            let indexed_user_staking_accounts_read = indexed_user_staking_accounts.read().await;
-            let user_staking_account = indexed_user_staking_accounts_read
-                .get(user_staking_account_key)
-                .expect("UserStaking account not found in the indexed user staking accounts");
-
-            // Retrieve the staked token mint - Which might not be defined for some account as it was a late addition to the program.
-            let staked_token_mint = match user_staking_account.get_staking_type() {
-                StakingType::LM => ADX_MINT,
-                StakingType::LP => ALP_MINT,
-            };
-
-            // Do a claim stake for the UserStaking account if we have a staked token mint
-            handlers::claim_stakes(
-                user_staking_account_key,
-                &owner_pubkey,
-                program,
-                median_priority_fee,
-                &staked_token_mint,
-            )
-            .await
-            .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+                // Do a claim stake for the UserStaking account if we have a staked token mint
+                handlers::claim_stakes(
+                    user_staking_account_key,
+                    &owner_pubkey,
+                    program,
+                    median_priority_fee,
+                    &staked_token_mint,
+                )
+                .await
+                .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+            } else {
+                log::warn!(
+                    "No owner found in DB for UserStaking account: {} - Skipping claim",
+                    user_staking_account_key
+                );
+            }
         }
     }
     Ok(())
+}
+
+async fn process_finalize_locked_stakes(
+    finalize_locked_stakes_cache: &FinalizeLockedStakesCacheThreadSafe,
+    indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
+    db: &tokio_postgres::Client,
+    program: &Program<Arc<Keypair>>,
+    median_priority_fee: u64,
+) -> Result<(), backoff::Error<anyhow::Error>> {
+    let current_time = chrono::Utc::now().timestamp();
+    let finalize_locked_stakes_cache = finalize_locked_stakes_cache.read().await;
+
+    for (user_staking_account_key, locked_stakes) in finalize_locked_stakes_cache.iter() {
+        for (stake_resolution_thread_id, end_time) in locked_stakes.iter() {
+            if current_time >= *end_time {
+                if let Some(owner_pubkey) = get_owner_pubkey(db, user_staking_account_key).await? {
+                    let indexed_user_staking_accounts_read =
+                        indexed_user_staking_accounts.read().await;
+                    let user_staking_account = indexed_user_staking_accounts_read
+                        .get(user_staking_account_key)
+                        .expect(
+                            "UserStaking account not found in the indexed user staking accounts",
+                        );
+                    let staked_token_mint = match user_staking_account.get_staking_type() {
+                        StakingType::LM => ADX_MINT,
+                        StakingType::LP => ALP_MINT,
+                    };
+                    handlers::finalize_locked_stake(
+                        user_staking_account_key,
+                        &owner_pubkey,
+                        program,
+                        median_priority_fee,
+                        &staked_token_mint,
+                        *stake_resolution_thread_id,
+                    )
+                    .await
+                    .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn get_owner_pubkey(
+    db: &tokio_postgres::Client,
+    user_staking_account_key: &Pubkey,
+) -> Result<Option<Pubkey>, backoff::Error<anyhow::Error>> {
+    let rows = db
+        .query(
+            "SELECT user_pubkey FROM ref_user_staking WHERE user_staking_pubkey = $1::TEXT",
+            &[&user_staking_account_key.to_string()],
+        )
+        .await
+        .map_err(|e| backoff::Error::transient(e.into()))?;
+
+    if let Some(row) = rows.first() {
+        Ok(Some(
+            Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey"),
+        ))
+    } else {
+        log::warn!(
+            "No owner found in DB for UserStaking account: {} - Skipping claim",
+            user_staking_account_key
+        );
+        Ok(None)
+    }
 }

@@ -1,8 +1,9 @@
 use {
-    crate::{handlers::create_claim_stakes_ix, CLAIM_STAKES_CU_LIMIT},
+    crate::{handlers::create_finalize_locked_stake_ix, CLAIM_STAKES_CU_LIMIT},
     adrena_abi::{
-        get_staking_lm_reward_token_vault_pda, get_staking_pda, get_staking_reward_token_vault_pda,
-        get_transfer_authority_pda, ADX_MINT, SPL_TOKEN_PROGRAM_ID, USDC_MINT,
+        get_governing_token_holding_pda, get_staking_pda, get_token_owner_record_pda,
+        get_transfer_authority_pda, ADRENA_GOVERNANCE_REALM_CONFIG_ID, ADRENA_GOVERNANCE_REALM_ID,
+        ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT, ADX_MINT, SPL_TOKEN_PROGRAM_ID, USDC_MINT,
     },
     anchor_client::Program,
     solana_client::rpc_config::RpcSendTransactionConfig,
@@ -11,15 +12,16 @@ use {
     std::sync::Arc,
 };
 
-pub async fn claim_stakes(
+pub async fn finalize_locked_stake(
     user_staking_account_key: &Pubkey,
     owner_pubkey: &Pubkey,
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
     staked_token_mint: &Pubkey,
+    stake_resolution_thread_id: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
-        "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+        "  <> Finalizing locked stake for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
         user_staking_account_key,
         owner_pubkey,
         staked_token_mint
@@ -27,18 +29,34 @@ pub async fn claim_stakes(
     let transfer_authority_pda = get_transfer_authority_pda().0;
     let staking_pda = get_staking_pda(staked_token_mint).0;
 
-    let staking_reward_token_vault_pda = get_staking_reward_token_vault_pda(&staking_pda).0;
-    let staking_lm_reward_token_vault_pda = get_staking_lm_reward_token_vault_pda(&staking_pda).0;
+    let governance_governing_token_holding_pda =
+        get_governing_token_holding_pda(&staking_pda, &ADRENA_GOVERNANCE_REALM_CONFIG_ID);
 
-    let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
-        &program.payer(),
-        owner_pubkey,
-        transfer_authority_pda,
-        &staking_pda,
-        user_staking_account_key,
-        &staking_reward_token_vault_pda,
-        &staking_lm_reward_token_vault_pda,
+    let governance_governing_token_owner_record_pda = get_token_owner_record_pda(
+        &governance_governing_token_holding_pda,
+        &ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT,
+        &ADRENA_GOVERNANCE_REALM_ID,
     );
+
+    let stake_resolution_thread_pda = adrena_abi::pda::get_sablier_thread_pda(
+        &transfer_authority_pda,
+        stake_resolution_thread_id.to_le_bytes().to_vec(),
+        None,
+    )
+    .0;
+
+    let (finalize_locked_stake_params, finalize_locked_stake_accounts) =
+        create_finalize_locked_stake_ix(
+            &program.payer(),
+            owner_pubkey,
+            stake_resolution_thread_id,
+            &transfer_authority_pda,
+            &staking_pda,
+            &stake_resolution_thread_pda,
+            user_staking_account_key,
+            &governance_governing_token_holding_pda,
+            &governance_governing_token_owner_record_pda,
+        );
 
     let tx = program
         .request()
@@ -60,8 +78,8 @@ pub async fn claim_stakes(
             &USDC_MINT,
             &SPL_TOKEN_PROGRAM_ID,
         ))
-        .args(claim_stakes_params)
-        .accounts(claim_stakes_accounts)
+        .args(finalize_locked_stake_params)
+        .accounts(finalize_locked_stake_accounts)
         .signed_transaction()
         .await
         .map_err(|e| {
@@ -87,7 +105,7 @@ pub async fn claim_stakes(
         })?;
 
     log::info!(
-        "  <> Claim stakes for staking account {:#?} - TX sent: {:#?}",
+        "  <> Finalize locked stake for staking account {:#?} - TX sent: {:#?}",
         user_staking_account_key,
         tx_hash.to_string(),
     );
