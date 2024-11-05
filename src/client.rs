@@ -1,7 +1,8 @@
 use {
     crate::{process_stream_message::process_stream_message, update_caches::update_claim_cache},
     adrena_abi::{
-        Staking, StakingType, UserStaking, ADX_MINT, ALP_MINT, ROUND_MIN_DURATION_SECONDS,
+        Discriminator, Staking, StakingType, UserStaking, ADX_MINT, ALP_MINT,
+        ROUND_MIN_DURATION_SECONDS,
     },
     anchor_client::{solana_sdk::signer::keypair::read_keypair_file, Client, Cluster, Program},
     backoff::{future::retry, ExponentialBackoff},
@@ -53,7 +54,6 @@ pub mod priority_fees;
 pub mod process_stream_message;
 pub mod update_caches;
 pub mod update_indexes;
-pub mod utils;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,14 +129,6 @@ impl Args {
     }
 }
 
-pub fn get_staking_anchor_discriminator() -> Vec<u8> {
-    utils::derive_discriminator("Staking").to_vec()
-}
-
-pub fn get_user_staking_anchor_discriminator() -> Vec<u8> {
-    utils::derive_discriminator("UserStaking").to_vec()
-}
-
 async fn generate_accounts_filter_map(
     indexed_user_staking_accounts: &IndexedUserStakingAccountsThreadSafe,
 ) -> AccountFilterMap {
@@ -149,7 +141,7 @@ async fn generate_accounts_filter_map(
             SubscribeRequestFilterAccountsFilterMemcmp {
                 offset: 0,
                 data: Some(AccountsFilterMemcmpOneof::Bytes(
-                    get_staking_anchor_discriminator(),
+                    Staking::DISCRIMINATOR.to_vec(),
                 )),
             },
         )),
@@ -178,7 +170,7 @@ async fn generate_accounts_filter_map(
             SubscribeRequestFilterAccountsFilterMemcmp {
                 offset: 0,
                 data: Some(AccountsFilterMemcmpOneof::Bytes(
-                    get_user_staking_anchor_discriminator(),
+                    UserStaking::DISCRIMINATOR.to_vec(),
                 )),
             },
         )),
@@ -307,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
                 {
                 let staking_pda_filter = RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
                     0,
-                    &get_staking_anchor_discriminator(),
+                    Staking::DISCRIMINATOR,
                 ));
                 let filters = vec![staking_pda_filter];
                 let existing_staking_accounts = program
@@ -327,13 +319,8 @@ async fn main() -> anyhow::Result<()> {
 
                 // User staking accounts
                 {
-                    let user_staking_pda_filter = RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
-                        0,
-                        &get_user_staking_anchor_discriminator(),
-                    ));
-                    let filters = vec![user_staking_pda_filter];
                     let existing_user_staking_accounts = program
-                        .accounts::<UserStaking>(filters)
+                        .accounts::<UserStaking>(vec![])
                         .await
                         .map_err(|e| backoff::Error::transient(e.into()))?;
                     {
