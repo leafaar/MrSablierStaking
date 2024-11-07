@@ -45,7 +45,7 @@ type IndexedUserStakingAccountsThreadSafe = Arc<RwLock<HashMap<Pubkey, UserStaki
 type UserStakingClaimCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, Option<i64>>>>;
 // Cache the time of next execution for the resolve staking round task, keyed by Staking account pda
 type StakingRoundNextResolveTimeCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, i64>>>;
-// Cache the list of UserStaking accounts and their stake resolution threads ids / time at which it may be finalized
+// Cache the list of UserStaking accounts and their stake ids/ time at which it may be finalized
 type FinalizeLockedStakesCacheThreadSafe = Arc<RwLock<HashMap<Pubkey, HashMap<u64, i64>>>>;
 
 pub mod handlers;
