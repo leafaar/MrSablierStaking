@@ -1,5 +1,5 @@
 use {
-    crate::{handlers::create_finalize_locked_stake_ix, CLAIM_STAKES_CU_LIMIT},
+    crate::handlers::create_finalize_locked_stake_ix,
     adrena_abi::{
         get_governing_token_holding_pda, get_staking_pda, get_token_owner_record_pda,
         get_transfer_authority_pda, ADRENA_GOVERNANCE_REALM_CONFIG_ID, ADRENA_GOVERNANCE_REALM_ID,
@@ -45,6 +45,8 @@ pub async fn finalize_locked_stake(
     )
     .0;
 
+    let rpc_client = program.rpc();
+
     let (finalize_locked_stake_params, finalize_locked_stake_accounts) =
         create_finalize_locked_stake_ix(
             &program.payer(),
@@ -58,14 +60,12 @@ pub async fn finalize_locked_stake(
             &governance_governing_token_owner_record_pda,
         );
 
-    let tx = program
+    let tx_simulation = program
         .request()
         .instruction(ComputeBudgetInstruction::set_compute_unit_price(
             median_priority_fee,
         ))
-        .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
-            CLAIM_STAKES_CU_LIMIT,
-        ))
+        .instruction(ComputeBudgetInstruction::set_compute_unit_limit(1_000_000))
         .instruction(create_associated_token_account_idempotent(
             &program.payer(),
             owner_pubkey,
@@ -87,7 +87,56 @@ pub async fn finalize_locked_stake(
             backoff::Error::transient(e.into())
         })?;
 
-    let rpc_client = program.rpc();
+    let simulation = rpc_client
+        .simulate_transaction(&tx_simulation)
+        .await
+        .unwrap();
+    // log::info!("Simulation result: {:?}", simulation);
+
+    let simulated_cu = simulation.value.units_consumed.unwrap();
+    // log::info!("CU consumed: {}", simulated_cu);
+
+    let (finalize_locked_stake_params, finalize_locked_stake_accounts) =
+        create_finalize_locked_stake_ix(
+            &program.payer(),
+            owner_pubkey,
+            stake_resolution_thread_id,
+            &transfer_authority_pda,
+            &staking_pda,
+            &stake_resolution_thread_pda,
+            user_staking_account_key,
+            &governance_governing_token_holding_pda,
+            &governance_governing_token_owner_record_pda,
+        );
+
+    let tx = program
+        .request()
+        .instruction(ComputeBudgetInstruction::set_compute_unit_price(
+            median_priority_fee,
+        ))
+        .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
+            (simulated_cu as f64 * 1.05) as u32, // +5% for safety
+        ))
+        .instruction(create_associated_token_account_idempotent(
+            &program.payer(),
+            owner_pubkey,
+            &ADX_MINT,
+            &SPL_TOKEN_PROGRAM_ID,
+        ))
+        .instruction(create_associated_token_account_idempotent(
+            &program.payer(),
+            owner_pubkey,
+            &USDC_MINT,
+            &SPL_TOKEN_PROGRAM_ID,
+        ))
+        .args(finalize_locked_stake_params)
+        .accounts(finalize_locked_stake_accounts)
+        .signed_transaction()
+        .await
+        .map_err(|e| {
+            log::error!("Transaction generation failed with error: {:?}", e);
+            backoff::Error::transient(e.into())
+        })?;
 
     let tx_hash = rpc_client
         .send_transaction_with_config(

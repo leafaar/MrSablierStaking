@@ -1,5 +1,5 @@
 use {
-    crate::{handlers::create_claim_stakes_ix, CLAIM_STAKES_CU_LIMIT},
+    crate::handlers::create_claim_stakes_ix,
     adrena_abi::{
         get_staking_lm_reward_token_vault_pda, get_staking_pda, get_staking_reward_token_vault_pda,
         get_transfer_authority_pda, ADX_MINT, SPL_TOKEN_PROGRAM_ID, USDC_MINT,
@@ -40,13 +40,63 @@ pub async fn claim_stakes(
         &staking_lm_reward_token_vault_pda,
     );
 
+    let rpc_client = program.rpc();
+
+    let tx_simulation = program
+        .request()
+        .instruction(ComputeBudgetInstruction::set_compute_unit_price(
+            median_priority_fee,
+        ))
+        .instruction(ComputeBudgetInstruction::set_compute_unit_limit(1_000_000))
+        .instruction(create_associated_token_account_idempotent(
+            &program.payer(),
+            owner_pubkey,
+            &ADX_MINT,
+            &SPL_TOKEN_PROGRAM_ID,
+        ))
+        .instruction(create_associated_token_account_idempotent(
+            &program.payer(),
+            owner_pubkey,
+            &USDC_MINT,
+            &SPL_TOKEN_PROGRAM_ID,
+        ))
+        .args(claim_stakes_params)
+        .accounts(claim_stakes_accounts)
+        .signed_transaction()
+        .await
+        .map_err(|e| {
+            log::error!(
+                "Simulation Transaction generation failed with error: {:?}",
+                e
+            );
+            backoff::Error::transient(e.into())
+        })?;
+
+    let simulation = rpc_client
+        .simulate_transaction(&tx_simulation)
+        .await
+        .unwrap();
+
+    let simulated_cu = simulation.value.units_consumed.unwrap();
+    // log::info!("CU consumed: {}", simulated_cu);
+
+    let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
+        &program.payer(),
+        owner_pubkey,
+        transfer_authority_pda,
+        &staking_pda,
+        user_staking_account_key,
+        &staking_reward_token_vault_pda,
+        &staking_lm_reward_token_vault_pda,
+    );
+
     let tx = program
         .request()
         .instruction(ComputeBudgetInstruction::set_compute_unit_price(
             median_priority_fee,
         ))
         .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
-            CLAIM_STAKES_CU_LIMIT,
+            (simulated_cu as f64 * 1.05) as u32, // +5% for safety
         ))
         .instruction(create_associated_token_account_idempotent(
             &program.payer(),
@@ -68,8 +118,6 @@ pub async fn claim_stakes(
             log::error!("Transaction generation failed with error: {:?}", e);
             backoff::Error::transient(e.into())
         })?;
-
-    let rpc_client = program.rpc();
 
     let tx_hash = rpc_client
         .send_transaction_with_config(
