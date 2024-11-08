@@ -18,12 +18,12 @@ pub async fn claim_stakes(
     median_priority_fee: u64,
     staked_token_mint: &Pubkey,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
-    log::info!(
-        "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
-        user_staking_account_key,
-        owner_pubkey,
-        staked_token_mint
-    );
+    // log::info!(
+    //     "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+    //     user_staking_account_key,
+    //     owner_pubkey,
+    //     staked_token_mint
+    // );
     let transfer_authority_pda = get_transfer_authority_pda().0;
     let staking_pda = get_staking_pda(staked_token_mint).0;
 

@@ -58,7 +58,8 @@ pub mod utils;
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const MEAN_PRIORITY_FEE_PERCENTILE: u64 = 5000; // 50th
+const MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND: u64 = 5000; // 50th
+const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 1500; // 15th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 380_000;
 pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
@@ -66,7 +67,8 @@ pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
 pub const LIQUIDATE_LONG_CU_LIMIT: u32 = 310_000;
 pub const LIQUIDATE_SHORT_CU_LIMIT: u32 = 210_000;
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
-pub const CLAIM_STAKES_CU_LIMIT: u32 = 400_000;
+// Temporary high CU limit for claim stakes - do simulation to check the cost instead
+pub const CLAIM_STAKES_CU_LIMIT: u32 = 1_000_000;
 
 // The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
 pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25;
@@ -392,25 +394,37 @@ async fn main() -> anyhow::Result<()> {
             // ////////////////////////////////////////////////////////////////
             // Side thread to fetch the median priority fee every 5 seconds
             // ////////////////////////////////////////////////////////////////
-            let median_priority_fee = Arc::new(Mutex::new(0u64));
+            let median_priority_fee_high = Arc::new(Mutex::new(0u64));
+            let median_priority_fee_low = Arc::new(Mutex::new(0u64));
             // Spawn a task to poll priority fees every 5 seconds
             log::info!("3 - Spawn a task to poll priority fees every 5 seconds...");
             #[allow(unused_assignments)]
             {
             periodical_priority_fees_fetching_task = Some({
-                let median_priority_fee = Arc::clone(&median_priority_fee);
+                let median_priority_fee_low = Arc::clone(&median_priority_fee_low);
+                let median_priority_fee_high = Arc::clone(&median_priority_fee_high);
                 tokio::spawn(async move {
                     let mut fee_refresh_interval = interval(PRIORITY_FEE_REFRESH_INTERVAL);
                     loop {
                         fee_refresh_interval.tick().await;
-                        if let Ok(fee) =
-                            fetch_mean_priority_fee(&client, MEAN_PRIORITY_FEE_PERCENTILE).await
+                        if let Ok(fee_high) =
+                            fetch_mean_priority_fee(&client, MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND).await
                         {
-                            let mut fee_lock = median_priority_fee.lock().await;
-                            *fee_lock = fee;
+                            let mut fee_lock = median_priority_fee_high.lock().await;
+                            *fee_lock = fee_high;
                             log::debug!(
                                 "  <> Updated median priority fee 50th percentile to : {} µLamports / cu",
-                                fee
+                                fee_high
+                            );
+                        }
+                        if let Ok(fee_low) =
+                            fetch_mean_priority_fee(&client, MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES).await
+                        {
+                            let mut fee_lock = median_priority_fee_low.lock().await;
+                            *fee_lock = fee_low;
+                            log::debug!(
+                                "  <> Updated median priority fee 15th percentile to : {} µLamports / cu",
+                                fee_low
                             );
                         }
                     }
@@ -459,17 +473,17 @@ async fn main() -> anyhow::Result<()> {
 
                 // Process any resolve staking round tasks
                 // let start = std::time::Instant::now();
-                process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee.lock().await).await?;
+                process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee_high.lock().await).await?;
                 // log::info!("process_resolve_staking_rounds took {:?}", start.elapsed());
 
                 // Process any claim stakes tasks
                 // let start = std::time::Instant::now();
-                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee.lock().await).await?;
+                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee_low.lock().await).await?;
                 // log::info!("process_claim_stakes took {:?}", start.elapsed());
 
                 // Process finalize locked stakes tasks
                 // let start = std::time::Instant::now();
-                process_finalize_locked_stakes(&finalize_locked_stakes_cache, &indexed_user_staking_accounts, &db, &program, *median_priority_fee.lock().await).await?;
+                process_finalize_locked_stakes(&finalize_locked_stakes_cache, &indexed_user_staking_accounts, &db, &program, *median_priority_fee_low.lock().await).await?;
                 // log::info!("process_finalize_locked_stakes took {:?}", start.elapsed());
             }
 
@@ -513,11 +527,21 @@ pub async fn process_claim_stakes(
     median_priority_fee: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     let current_time = chrono::Utc::now().timestamp();
-    let claim_cache = claim_cache.read().await;
-    for (user_staking_account_key, last_claim_time) in claim_cache
+    let mut claim_cache = claim_cache.write().await;
+
+    // Process a max of 10 claims per loop
+    let max_claims_per_loop = 10;
+    let mut claim_count = 0;
+    let claim_cache_shallow_copy = claim_cache.clone();
+
+    for (user_staking_account_key, last_claim_time) in claim_cache_shallow_copy
         .iter()
         .filter(|(_, last_claim_time)| last_claim_time.is_some())
     {
+        if claim_count >= max_claims_per_loop {
+            log::info!("Batch size reached - stopping claim processing until next loop");
+            break;
+        }
         if current_time >= last_claim_time.unwrap() + AUTO_CLAIM_THRESHOLD_SECONDS {
             // retrieve the owner of the UserStaking account
             if let Some(owner_pubkey) = get_owner_pubkey(db, user_staking_account_key).await? {
@@ -549,6 +573,14 @@ pub async fn process_claim_stakes(
                     user_staking_account_key
                 );
             }
+            claim_count += 1;
+
+            // Remove the user without owner in db for now, will be reprocessed when the owner is found
+            claim_cache.remove(user_staking_account_key);
+            log::warn!(
+                "Removed UserStaking account from claim cache: {} - will be reprocessed when his account updates",
+                user_staking_account_key
+            );
         }
     }
     Ok(())
@@ -613,8 +645,8 @@ async fn get_owner_pubkey(
             Pubkey::from_str(row.get::<_, String>(0).as_str()).expect("Invalid pubkey"),
         ))
     } else {
-        log::warn!(
-            "No owner found in DB for UserStaking account: {} - Skipping claim",
+        log::debug!(
+            "No owner found in DB for UserStaking account: {}",
             user_staking_account_key
         );
         Ok(None)
