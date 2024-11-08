@@ -67,8 +67,6 @@ pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
 pub const LIQUIDATE_LONG_CU_LIMIT: u32 = 310_000;
 pub const LIQUIDATE_SHORT_CU_LIMIT: u32 = 210_000;
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
-// Temporary high CU limit for claim stakes - do simulation to check the cost instead
-pub const CLAIM_STAKES_CU_LIMIT: u32 = 1_000_000;
 
 // The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
 pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25;
