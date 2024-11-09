@@ -2,8 +2,8 @@ use {
     adrena_abi::{
         ADRENA_GOVERNANCE_REALM_CONFIG_ID, ADRENA_GOVERNANCE_REALM_ID,
         ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT, ADX_MINT, CORTEX_ID, GENESIS_LOCK_ID,
-        GOVERNANCE_PROGRAM_ID, MAIN_POOL_ID, SABLIER_THREAD_PROGRAM_ID,
-        SPL_ASSOCIATED_TOKEN_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID, USDC_MINT,
+        GOVERNANCE_PROGRAM_ID, MAIN_POOL_ID, SPL_ASSOCIATED_TOKEN_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+        USDC_MINT,
     },
     solana_sdk::{pubkey::Pubkey, system_program},
 };
@@ -97,10 +97,9 @@ pub fn create_claim_stakes_ix(
 pub fn create_finalize_locked_stake_ix(
     payer: &Pubkey,
     owner_pubkey: &Pubkey,
-    stake_resolution_thread_id: u64,
+    locked_stake_id: u64,
     transfer_authority_pda: &Pubkey,
     staking_pda: &Pubkey,
-    stake_resolution_thread_pda: &Pubkey,
     user_staking_account_pda: &Pubkey,
     governance_governing_token_holding_pda: &Pubkey,
     governance_governing_token_owner_record_pda: &Pubkey,
@@ -111,7 +110,7 @@ pub fn create_finalize_locked_stake_ix(
     let args = adrena_abi::instruction::FinalizeLockedStake {
         params: adrena_abi::types::FinalizeLockedStakeParams {
             early_exit: false,
-            thread_id: stake_resolution_thread_id,
+            locked_stake_id,
         },
     };
     let finalize_locked_stake = adrena_abi::accounts::FinalizeLockedStake {
@@ -127,9 +126,7 @@ pub fn create_finalize_locked_stake_ix(
         staking: *staking_pda,
         cortex: CORTEX_ID,
         lm_token_mint: ADX_MINT,
-        stake_resolution_thread: *stake_resolution_thread_pda,
         governance_program: GOVERNANCE_PROGRAM_ID,
-        sablier_program: SABLIER_THREAD_PROGRAM_ID,
         adrena_program: adrena_abi::ID,
         system_program: system_program::ID,
         token_program: SPL_TOKEN_PROGRAM_ID,

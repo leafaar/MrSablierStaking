@@ -18,7 +18,7 @@ pub async fn finalize_locked_stake(
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
     staked_token_mint: &Pubkey,
-    stake_resolution_thread_id: u64,
+    locked_stake_id: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
         "  <> Finalizing locked stake for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
@@ -38,23 +38,15 @@ pub async fn finalize_locked_stake(
         &ADRENA_GOVERNANCE_REALM_ID,
     );
 
-    let stake_resolution_thread_pda = adrena_abi::pda::get_sablier_thread_pda(
-        &transfer_authority_pda,
-        stake_resolution_thread_id.to_le_bytes().to_vec(),
-        None,
-    )
-    .0;
-
     let rpc_client = program.rpc();
 
     let (finalize_locked_stake_params, finalize_locked_stake_accounts) =
         create_finalize_locked_stake_ix(
             &program.payer(),
             owner_pubkey,
-            stake_resolution_thread_id,
+            locked_stake_id,
             &transfer_authority_pda,
             &staking_pda,
-            &stake_resolution_thread_pda,
             user_staking_account_key,
             &governance_governing_token_holding_pda,
             &governance_governing_token_owner_record_pda,
@@ -100,10 +92,9 @@ pub async fn finalize_locked_stake(
         create_finalize_locked_stake_ix(
             &program.payer(),
             owner_pubkey,
-            stake_resolution_thread_id,
+            locked_stake_id,
             &transfer_authority_pda,
             &staking_pda,
-            &stake_resolution_thread_pda,
             user_staking_account_key,
             &governance_governing_token_holding_pda,
             &governance_governing_token_owner_record_pda,

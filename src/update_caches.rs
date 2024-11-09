@@ -107,7 +107,7 @@ pub async fn update_finalize_locked_stakes_cache_for_account(
                 .await
                 .entry(*user_staking_account_key)
                 .or_insert_with(HashMap::new)
-                .insert(ls.stake_resolution_thread_id, ls.end_time);
+                .insert(ls.id, ls.end_time);
         }
     }
 }
