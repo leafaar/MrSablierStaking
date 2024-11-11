@@ -18,12 +18,12 @@ pub async fn claim_stakes(
     median_priority_fee: u64,
     staked_token_mint: &Pubkey,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
-    // log::info!(
-    //     "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
-    //     user_staking_account_key,
-    //     owner_pubkey,
-    //     staked_token_mint
-    // );
+    log::info!(
+        "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+        user_staking_account_key,
+        owner_pubkey,
+        staked_token_mint
+    );
     let transfer_authority_pda = get_transfer_authority_pda().0;
     let staking_pda = get_staking_pda(staked_token_mint).0;
 
@@ -34,7 +34,7 @@ pub async fn claim_stakes(
     let mut remaining_indices: Vec<u8> = (0..32).collect();
     let mut postponed_indices: Vec<u8> = vec![];
 
-    while !remaining_indices.is_empty() && !postponed_indices.is_empty() {
+    while !remaining_indices.is_empty() || !postponed_indices.is_empty() {
         let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
             &program.payer(),
             owner_pubkey,
@@ -78,21 +78,40 @@ pub async fn claim_stakes(
                 backoff::Error::transient(e.into())
             })?;
 
-        let simulation = rpc_client
-            .simulate_transaction(&tx_simulation)
-            .await
-            .unwrap();
+        let mut simulation_attempts = 0;
+        let simulation = loop {
+            match rpc_client.simulate_transaction(&tx_simulation).await {
+                Ok(simulation) => break simulation,
+                Err(e) => {
+                    if e.to_string().contains("BlockhashNotFound") {
+                        simulation_attempts += 1;
+                        log::warn!(
+                            "Simulation attempt {} failed with error: {:?}",
+                            simulation_attempts,
+                            e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                        if simulation_attempts >= 50 {
+                            return Err(backoff::Error::transient(e.into()));
+                        }
+                    }
+                    // If it's not a blockhash not found, we continue it's treated later
+                }
+            }
+        };
 
         let simulated_cu = simulation.value.units_consumed.unwrap();
 
         // If CU exceeds 1 million, reduce the number of indices (we use 1m instead of 1.4m cause it's more likely to land - eventually lower that further)
-        if simulated_cu > 1_000_000 {
+        if simulated_cu >= 1_000_000 || simulated_cu == 0 {
             log::info!(
-                "CU consumed: {} - too high, postponing a locked stake and retrying",
+                "   <> CU consumed: {} - too high, postponing a locked stake and retrying",
                 simulated_cu
             );
             postponed_indices.push(remaining_indices.pop().unwrap());
             continue;
+        } else {
+            log::info!("   <> CU consumed: {}", simulated_cu);
         }
 
         let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
@@ -139,7 +158,7 @@ pub async fn claim_stakes(
             .send_transaction_with_config(
                 &tx,
                 RpcSendTransactionConfig {
-                    skip_preflight: true,
+                    skip_preflight: false,
                     max_retries: Some(0),
                     ..Default::default()
                 },

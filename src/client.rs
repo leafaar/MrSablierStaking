@@ -575,6 +575,7 @@ pub async fn process_claim_stakes(
                 )
                 .await
                 .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+                claim_count += 1;
             } else {
                 log::warn!(
                     "No owner found in DB for UserStaking account: {} - Skipping claim",
@@ -588,7 +589,6 @@ pub async fn process_claim_stakes(
                     user_staking_account_key
                 );
             }
-            claim_count += 1;
         }
     }
     Ok(())
