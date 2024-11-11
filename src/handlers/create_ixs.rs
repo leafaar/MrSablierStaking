@@ -47,6 +47,7 @@ pub fn create_claim_stakes_ix(
     user_staking_account_pda: &Pubkey,
     staking_reward_token_vault_pda: &Pubkey,
     staking_lm_reward_token_vault_pda: &Pubkey,
+    locked_stake_indexes: Option<&Vec<u8>>,
 ) -> (
     adrena_abi::instruction::ClaimStakes,
     adrena_abi::accounts::ClaimStakes,
@@ -70,7 +71,11 @@ pub fn create_claim_stakes_ix(
     )
     .0;
 
-    let args = adrena_abi::instruction::ClaimStakes {};
+    let args = adrena_abi::instruction::ClaimStakes {
+        params: adrena_abi::types::ClaimStakesParams {
+            locked_stake_indexes: locked_stake_indexes.cloned(),
+        },
+    };
     let accounts = adrena_abi::accounts::ClaimStakes {
         caller: *payer,
         payer: *payer,

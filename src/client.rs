@@ -16,7 +16,7 @@ use {
     tokio::{
         sync::{Mutex, RwLock},
         task::JoinHandle,
-        time::interval,
+        time::{interval, timeout},
     },
     tonic::transport::channel::ClientTlsConfig,
     update_caches::{
@@ -61,7 +61,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND: u64 = 5000; // 50th
 const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 1500; // 15th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 380_000;
+pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 330_000; // around 290k on average
 pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
 pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
 pub const LIQUIDATE_LONG_CU_LIMIT: u32 = 310_000;
@@ -69,7 +69,7 @@ pub const LIQUIDATE_SHORT_CU_LIMIT: u32 = 210_000;
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
 
 // The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
-pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 25;
+pub const AUTO_CLAIM_THRESHOLD_SECONDS: i64 = ROUND_MIN_DURATION_SECONDS * 20; // this means that we will claim ~5 days if the user has not claim during that time
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 enum ArgsCommitment {
@@ -440,30 +440,40 @@ async fn main() -> anyhow::Result<()> {
             // ////////////////////////////////////////////////////////////////
             log::info!("4 - Start core loop: processing gRPC stream...");
             loop {
-                // Process any stream messages
-                if let Some(message) = stream.next().await {
-                    match process_stream_message(
-                        message.map_err(|e| backoff::Error::transient(e.into())),
-                        &indexed_staking_accounts,
-                        &indexed_user_staking_accounts,
-                        &claim_cache,
-                        &finalize_locked_stakes_cache,
-                        &staking_round_next_resolve_time_cache,
-                        &mut subscribe_tx,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            // Stream message processed successfully - onward with the loop
-                        },
-                        Err(backoff::Error::Permanent(e)) => {
-                            log::error!("Permanent error: {:?}", e);
-                            break;
+                // Set a timeout for receiving messages
+                match timeout(Duration::from_secs(11), stream.next()).await {
+                    Ok(Some(message)) => {
+                        match process_stream_message(
+                            message.map_err(|e| backoff::Error::transient(e.into())),
+                            &indexed_staking_accounts,
+                            &indexed_user_staking_accounts,
+                            &claim_cache,
+                            &finalize_locked_stakes_cache,
+                            &staking_round_next_resolve_time_cache,
+                            &mut subscribe_tx,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                // Stream message processed successfully - onward with the loop
+                            },
+                            Err(backoff::Error::Permanent(e)) => {
+                                log::error!("Permanent error: {:?}", e);
+                                break;
+                            }
+                            Err(backoff::Error::Transient { err, .. }) => {
+                                log::warn!("Transient error: {:?}", err);
+                                // Handle transient error without breaking the loop
+                            }
                         }
-                        Err(backoff::Error::Transient { err, .. }) => {
-                            log::warn!("Transient error: {:?}", err);
-                            // Handle transient error without breaking the loop
-                        }
+                    }
+                    Ok(None) => {
+                        log::warn!("Stream closed by server - restarting connection");
+                        break;
+                    }
+                    Err(_) => {
+                        log::warn!("No message received in 11 seconds, restarting connection (we should be getting at least a ping every 10 seconds)");
+                        break;
                     }
                 }
 
@@ -565,20 +575,20 @@ pub async fn process_claim_stakes(
                 )
                 .await
                 .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+                claim_count += 1;
             } else {
                 log::warn!(
                     "No owner found in DB for UserStaking account: {} - Skipping claim",
                     user_staking_account_key
                 );
-            }
-            claim_count += 1;
 
-            // Remove the user without owner in db for now, will be reprocessed when the owner is found
-            claim_cache.remove(user_staking_account_key);
-            log::warn!(
-                "Removed UserStaking account from claim cache: {} - will be reprocessed when his account updates",
-                user_staking_account_key
-            );
+                // Remove the user without owner in db for now, will be reprocessed when the owner is found
+                claim_cache.remove(user_staking_account_key);
+                log::warn!(
+                    "Removed UserStaking account from claim cache: {} - will be reprocessed when his account updates",
+                    user_staking_account_key
+                );
+            }
         }
     }
     Ok(())
