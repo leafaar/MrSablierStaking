@@ -58,14 +58,9 @@ pub mod update_indexes;
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND: u64 = 7500; // 75th
-const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 4000; // 40th
+const MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND: u64 = 7000; // 70th
+const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 3500; // 35th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-pub const CLOSE_POSITION_LONG_CU_LIMIT: u32 = 330_000; // around 290k on average
-pub const CLOSE_POSITION_SHORT_CU_LIMIT: u32 = 280_000;
-pub const CLEANUP_POSITION_CU_LIMIT: u32 = 60_000;
-pub const LIQUIDATE_LONG_CU_LIMIT: u32 = 310_000;
-pub const LIQUIDATE_SHORT_CU_LIMIT: u32 = 210_000;
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
 
 // The threshold to trigger a claim of the stakes for a UserStaking account - we can store up to 32 rounds data per account, we do so to avoid loosing rewards
@@ -537,7 +532,7 @@ pub async fn process_claim_stakes(
             log::info!("Batch size reached - stopping claim processing until next loop");
             break;
         }
-        if current_time >= last_claim_time.unwrap() + AUTO_CLAIM_THRESHOLD_SECONDS {
+        if current_time >= last_claim_time.unwrap_or(0) + AUTO_CLAIM_THRESHOLD_SECONDS {
             // retrieve the owner of the UserStaking account
             if let Some(owner_pubkey) = get_owner_pubkey(db, user_staking_account_key).await? {
                 // Retrieve the UserStaking account

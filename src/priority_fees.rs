@@ -20,7 +20,7 @@ pub async fn fetch_mean_priority_fee(
     let config = GetRecentPrioritizationFeesByPercentileConfig {
         percentile: Some(percentile),
         fallback: false,
-        locked_writable_accounts: vec![], //adrena_abi::MAIN_POOL_ID, adrena_abi::CORTEX_ID],
+        locked_writable_accounts: vec![],
     };
     get_mean_prioritization_fee_by_percentile(client, &config, None)
         .await

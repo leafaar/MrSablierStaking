@@ -19,7 +19,7 @@ pub async fn claim_stakes(
     staked_token_mint: &Pubkey,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
-        "  <> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+        "  <*> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
         user_staking_account_key,
         owner_pubkey,
         staked_token_mint
@@ -72,7 +72,7 @@ pub async fn claim_stakes(
             .await
             .map_err(|e| {
                 log::error!(
-                    "Simulation Transaction generation failed with error: {:?}",
+                    "   <> Simulation Transaction generation failed with error: {:?}",
                     e
                 );
                 backoff::Error::transient(e.into())
@@ -86,12 +86,12 @@ pub async fn claim_stakes(
                     if e.to_string().contains("BlockhashNotFound") {
                         simulation_attempts += 1;
                         log::warn!(
-                            "Simulation attempt {} failed with error: {:?}",
+                            "   <> Simulation attempt {} failed with error: {:?} - Retrying...",
                             simulation_attempts,
                             e
                         );
                         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                        if simulation_attempts >= 50 {
+                        if simulation_attempts >= 25 {
                             return Err(backoff::Error::transient(e.into()));
                         }
                     }
@@ -100,15 +100,30 @@ pub async fn claim_stakes(
             }
         };
 
-        let simulated_cu = simulation.value.units_consumed.unwrap();
+        let simulated_cu = simulation.value.units_consumed.unwrap_or(0);
 
-        // If CU exceeds 1 million, reduce the number of indices (we use 1m instead of 1.4m cause it's more likely to land - eventually lower that further)
-        if simulated_cu >= 1_000_000 || simulated_cu == 0 {
-            log::info!(
-                "   <> CU consumed: {} - too high, postponing a locked stake and retrying",
+        if simulated_cu == 0 {
+            log::warn!(
+                "   <> CU consumed: {} - Seems that the simulation cannot be performed due to low sol balance OR that the state is not updated yet (postpone)",
                 simulated_cu
             );
-            postponed_indices.push(remaining_indices.pop().unwrap());
+            break;
+        }
+
+        // If CU exceeds 1 million, reduce the number of indices (we use 500k instead of 1.4m cause it's more likely to land - eventually lower that further)
+        if simulated_cu >= 500_000 {
+            log::info!(
+                "   <> CU consumed: {} - too high, postponing locked stake and retrying",
+                simulated_cu
+            );
+            if let Some(index) = remaining_indices.pop() {
+                postponed_indices.push(index);
+            } else {
+                log::warn!("   <> No more indices to pop from remaining_indices");
+                return Err(backoff::Error::transient(anyhow::anyhow!(
+                    "   <> No indices left to pop - Aborting"
+                )));
+            }
             continue;
         } else {
             log::info!("   <> CU consumed: {}", simulated_cu);
@@ -131,7 +146,7 @@ pub async fn claim_stakes(
                 median_priority_fee,
             ))
             .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
-                (simulated_cu as f64 * 1.05) as u32, // +5% for safety
+                (simulated_cu as f64 * 1.02) as u32, // +2% for any jitter due to find_pda calls
             ))
             .instruction(create_associated_token_account_idempotent(
                 &program.payer(),
@@ -150,7 +165,7 @@ pub async fn claim_stakes(
             .signed_transaction()
             .await
             .map_err(|e| {
-                log::error!("Transaction generation failed with error: {:?}", e);
+                log::error!("   <> Transaction generation failed with error: {:?}", e);
                 backoff::Error::transient(e.into())
             })?;
 
@@ -165,12 +180,12 @@ pub async fn claim_stakes(
             )
             .await
             .map_err(|e| {
-                log::error!("Transaction sending failed with error: {:?}", e);
+                log::error!("   <> Transaction sending failed with error: {:?}", e);
                 backoff::Error::transient(e.into())
             })?;
 
         log::info!(
-            "  <> Claim stakes for staking account {:#?} - TX sent: {:#?}",
+            "   <> Claim stakes for staking account {:#?} - TX sent: {:#?}",
             user_staking_account_key,
             tx_hash.to_string(),
         );

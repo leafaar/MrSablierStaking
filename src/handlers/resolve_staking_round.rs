@@ -13,7 +13,7 @@ pub async fn resolve_staking_round(
     median_priority_fee: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
-        "  <> Resolving staking round for staking account {:#?}",
+        "  <*> Resolving staking round for staking account {:#?}",
         staking_account_key
     );
 

@@ -21,7 +21,7 @@ pub async fn finalize_locked_stake(
     locked_stake_id: u64,
 ) -> Result<(), backoff::Error<anyhow::Error>> {
     log::info!(
-        "  <> Finalizing locked stake for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
+        "  <*> Finalizing locked stake for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
         user_staking_account_key,
         owner_pubkey,
         staked_token_mint
@@ -75,17 +75,30 @@ pub async fn finalize_locked_stake(
         .signed_transaction()
         .await
         .map_err(|e| {
-            log::error!("Transaction generation failed with error: {:?}", e);
+            log::error!("   <> Transaction generation failed with error: {:?}", e);
             backoff::Error::transient(e.into())
         })?;
 
     let simulation = rpc_client
         .simulate_transaction(&tx_simulation)
         .await
-        .unwrap();
+        .map_err(|e| {
+            log::error!("   <> Simulation failed with error: {:?}", e);
+            backoff::Error::transient(e.into())
+        })?;
     // log::info!("Simulation result: {:?}", simulation);
 
-    let simulated_cu = simulation.value.units_consumed.unwrap();
+    let simulated_cu = simulation.value.units_consumed.unwrap_or(0);
+
+    if simulated_cu == 0 {
+        log::warn!(
+            "   <> CU consumed: {} - Seems that the simulation cannot be performed due to low sol balance OR that the state is not updated yet (postpone)",
+            simulated_cu
+        );
+        return Err(backoff::Error::transient(anyhow::anyhow!(
+            "0 cu simulation"
+        )));
+    }
     // log::info!("CU consumed: {}", simulated_cu);
 
     let (finalize_locked_stake_params, finalize_locked_stake_accounts) =
@@ -106,7 +119,7 @@ pub async fn finalize_locked_stake(
             median_priority_fee,
         ))
         .instruction(ComputeBudgetInstruction::set_compute_unit_limit(
-            (simulated_cu as f64 * 1.05) as u32, // +5% for safety
+            (simulated_cu as f64 * 1.02) as u32, // +2% for any jitter due to find_pda calls
         ))
         .instruction(create_associated_token_account_idempotent(
             &program.payer(),
@@ -125,7 +138,7 @@ pub async fn finalize_locked_stake(
         .signed_transaction()
         .await
         .map_err(|e| {
-            log::error!("Transaction generation failed with error: {:?}", e);
+            log::error!("   <> Transaction generation failed with error: {:?}", e);
             backoff::Error::transient(e.into())
         })?;
 
@@ -140,12 +153,12 @@ pub async fn finalize_locked_stake(
         )
         .await
         .map_err(|e| {
-            log::error!("Transaction sending failed with error: {:?}", e);
+            log::error!("   <> Transaction sending failed with error: {:?}", e);
             backoff::Error::transient(e.into())
         })?;
 
     log::info!(
-        "  <> Finalize locked stake for staking account {:#?} - TX sent: {:#?}",
+        "   <> Finalize locked stake for staking account {:#?} - TX sent: {:#?}",
         user_staking_account_key,
         tx_hash.to_string(),
     );
