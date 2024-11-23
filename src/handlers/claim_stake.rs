@@ -30,7 +30,7 @@ pub async fn claim_stakes(
     let staking_reward_token_vault_pda = get_staking_reward_token_vault_pda(&staking_pda).0;
     let staking_lm_reward_token_vault_pda = get_staking_lm_reward_token_vault_pda(&staking_pda).0;
 
-    // First attempt to claim all stakes - if simu fails, we will slowly reduce
+    // First attempt to claim all stakes - if simulation fails, we will slowly reduce
     let mut remaining_indices: Vec<u8> = (0..32).collect();
     let mut postponed_indices: Vec<u8> = vec![];
 
@@ -90,8 +90,7 @@ pub async fn claim_stakes(
                             simulation_attempts,
                             e
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                        if simulation_attempts >= 25 {
+                        if simulation_attempts >= 50 {
                             return Err(backoff::Error::transient(e.into()));
                         }
                     }
@@ -101,6 +100,8 @@ pub async fn claim_stakes(
         };
 
         let simulated_cu = simulation.value.units_consumed.unwrap_or(0);
+        // let simulation_logs = simulation.value.logs.unwrap_or(vec![]);
+        // println!("   <> Simulation logs: {:?}", simulation_logs);
 
         if simulated_cu == 0 {
             log::warn!(
@@ -111,7 +112,7 @@ pub async fn claim_stakes(
         }
 
         // If CU exceeds 1 million, reduce the number of indices (we use 500k instead of 1.4m cause it's more likely to land - eventually lower that further)
-        if simulated_cu >= 500_000 {
+        if simulated_cu >= 1_000_000 {
             log::info!(
                 "   <> CU consumed: {} - too high, postponing locked stake and retrying",
                 simulated_cu
@@ -173,7 +174,7 @@ pub async fn claim_stakes(
             .send_transaction_with_config(
                 &tx,
                 RpcSendTransactionConfig {
-                    skip_preflight: false,
+                    skip_preflight: true,
                     max_retries: Some(0),
                     ..Default::default()
                 },
