@@ -8,6 +8,7 @@ use {
     backoff::{future::retry, ExponentialBackoff},
     clap::Parser,
     futures::{StreamExt, TryFutureExt},
+    handlers::ClaimStakeOutcome,
     openssl::ssl::{SslConnector, SslMethod},
     postgres_openssl::MakeTlsConnector,
     priority_fees::fetch_mean_priority_fee,
@@ -59,7 +60,7 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:10000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEAN_PRIORITY_FEE_PERCENTILE_RESOLVE_STAKING_ROUND: u64 = 3500; // 35th
-const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 2500; // 25th
+const MEAN_PRIORITY_FEE_PERCENTILE_CLAIM_STAKES: u64 = 3500; // 35th
 const PRIORITY_FEE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub const RESOLVE_STAKING_ROUND_CU_LIMIT: u32 = 400_000;
 
@@ -326,6 +327,14 @@ async fn main() -> anyhow::Result<()> {
                         let existing_user_staking_accounts_with_staking_type: HashMap<Pubkey, UserStaking> = existing_user_staking_accounts.into_iter().filter(|a| a.1.staking_type != 0).collect();
                         log::info!("  <> # of existing UserStaking accounts w/o staking type defined filtered out: {}", existing_user_staking_accounts_len - existing_user_staking_accounts_with_staking_type.len());
 
+                        // DEBUG helper
+                        // let target_account = Pubkey::from_str("").unwrap(); 
+                        // let existing_user_staking_accounts_with_staking_type: HashMap<Pubkey, UserStaking> = existing_user_staking_accounts_with_staking_type
+                        //     .into_iter()
+                        //     .filter(|(k,_)| *k == target_account)
+                        //     .collect();
+                        // END DEBUG helper
+                        
                         indexed_user_staking_accounts.extend(existing_user_staking_accounts_with_staking_type);
                     }
                     log::info!(
@@ -421,60 +430,66 @@ async fn main() -> anyhow::Result<()> {
             // coming from the position accounts, we update the indexed positions map
             // ////////////////////////////////////////////////////////////////
             log::info!("4 - Start core loop: processing gRPC stream...");
+            // Create intervals for each task
+            let mut resolve_staking_rounds_interval = interval(Duration::from_secs(30));
+            let mut claim_stakes_interval = interval(Duration::from_secs(20));
+            let mut finalize_locked_stakes_interval = interval(Duration::from_secs(20));
+
             loop {
-                // Set a timeout for receiving messages
-                match timeout(Duration::from_secs(11), stream.next()).await {
-                    Ok(Some(message)) => {
-                        match process_stream_message(
-                            message.map_err(|e| backoff::Error::transient(e.into())),
-                            &indexed_staking_accounts,
-                            &indexed_user_staking_accounts,
-                            &claim_cache,
-                            &finalize_locked_stakes_cache,
+                tokio::select! {
+                    _ = resolve_staking_rounds_interval.tick() => {
+                        process_resolve_staking_rounds(
                             &staking_round_next_resolve_time_cache,
-                            &mut subscribe_tx,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                // Stream message processed successfully - onward with the loop
+                            &program,
+                            *median_priority_fee_high.lock().await,
+                        ).await?;
+                    },
+                    _ = claim_stakes_interval.tick() => {
+                        process_claim_stakes(
+                            &claim_cache,
+                            &db,
+                            &indexed_user_staking_accounts,
+                            &program,
+                            *median_priority_fee_low.lock().await,
+                        ).await?;
+                    },
+                    _ = finalize_locked_stakes_interval.tick() => {
+                        process_finalize_locked_stakes(
+                            &finalize_locked_stakes_cache,
+                            &indexed_user_staking_accounts,
+                            &db,
+                            &program,
+                            *median_priority_fee_low.lock().await,
+                        ).await?;
+                    },
+                    // Handle incoming messages with a timeout
+                    result = timeout(Duration::from_secs(11), stream.next()) => {
+                        match result {
+                            Ok(Some(Ok(msg))) => {
+                                // Process the message
+                                process_stream_message(
+                                    Ok(msg),
+                                    &indexed_staking_accounts,
+                                    &indexed_user_staking_accounts,
+                                    &claim_cache,
+                                    &finalize_locked_stakes_cache,
+                                    &staking_round_next_resolve_time_cache,
+                                    &mut subscribe_tx,
+                                ).await?;
                             },
-                            Err(backoff::Error::Permanent(e)) => {
-                                log::error!("Permanent error: {:?}", e);
+                            Ok(Some(Err(e))) => {
+                                log::warn!("Error receiving message: {:?}", e);
+                            },
+                            Ok(None) => {
+                                log::warn!("Stream closed by server - restarting connection");
                                 break;
-                            }
-                            Err(backoff::Error::Transient { err, .. }) => {
-                                log::warn!("Transient error: {:?}", err);
-                                // Handle transient error without breaking the loop
+                            },
+                            Err(_) => {
+                                log::warn!("Timeout waiting for message");
                             }
                         }
                     }
-                    Ok(None) => {
-                        log::warn!("Stream closed by server - restarting connection");
-                        break;
-                    }
-                    Err(_) => {
-                        log::warn!("No message received in 11 seconds, restarting connection (we should be getting at least a ping every 10 seconds)");
-                        break;
-                    }
                 }
-
-                // The methods below are evaluated each time a message is processed form the stream (and that also happen periodically through the ping)
-
-                // Process any resolve staking round tasks
-                // let start = std::time::Instant::now();
-                process_resolve_staking_rounds(&staking_round_next_resolve_time_cache, &program, *median_priority_fee_high.lock().await).await?;
-                // log::info!("process_resolve_staking_rounds took {:?}", start.elapsed());
-
-                // Process any claim stakes tasks
-                // let start = std::time::Instant::now();
-                process_claim_stakes(&claim_cache, &db, &indexed_user_staking_accounts, &program, *median_priority_fee_low.lock().await).await?;
-                // log::info!("process_claim_stakes took {:?}", start.elapsed());
-
-                // Process finalize locked stakes tasks
-                // let start = std::time::Instant::now();
-                process_finalize_locked_stakes(&finalize_locked_stakes_cache, &indexed_user_staking_accounts, &db, &program, *median_priority_fee_low.lock().await).await?;
-                // log::info!("process_finalize_locked_stakes took {:?}", start.elapsed());
             }
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
@@ -555,7 +570,7 @@ pub async fn process_claim_stakes(
                     || user_staking_account.liquid_stake.amount != 0;
 
                 if has_stake {
-                    handlers::claim_stakes(
+                    let outcome = handlers::claim_stakes(
                         user_staking_account_key,
                         &owner_pubkey,
                         program,
@@ -564,6 +579,22 @@ pub async fn process_claim_stakes(
                     )
                     .await
                     .map_err(|e| backoff::Error::transient(anyhow::anyhow!(e)))?;
+
+                    match outcome {
+                        ClaimStakeOutcome::Success => {
+                            // Do nothing, the on-chain account modification will update the cache from the message filtering
+                        }
+                        ClaimStakeOutcome::NoRewardTokens => {
+                            // On chain account won't be updated here, so we have to update the cache manually
+                            claim_cache.insert(
+                                *user_staking_account_key,
+                                Some(current_time + AUTO_CLAIM_THRESHOLD_SECONDS),
+                            );
+                        }
+                        ClaimStakeOutcome::Error(e) => {
+                            return Err(backoff::Error::transient(anyhow::anyhow!(e)));
+                        }
+                    }
                 }
                 claim_count += 1;
             } else {

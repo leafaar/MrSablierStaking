@@ -11,13 +11,19 @@ use {
     std::sync::Arc,
 };
 
+pub enum ClaimStakeOutcome {
+    Success,
+    NoRewardTokens,
+    Error(anyhow::Error),
+}
+
 pub async fn claim_stakes(
     user_staking_account_key: &Pubkey,
     owner_pubkey: &Pubkey,
     program: &Program<Arc<Keypair>>,
     median_priority_fee: u64,
     staked_token_mint: &Pubkey,
-) -> Result<(), backoff::Error<anyhow::Error>> {
+) -> Result<ClaimStakeOutcome, backoff::Error<anyhow::Error>> {
     log::info!(
         "  <*> Claiming stakes for UserStaking account {:#?} (owner: {:#?} staked token: {:#?})",
         user_staking_account_key,
@@ -33,7 +39,7 @@ pub async fn claim_stakes(
     // First attempt to claim all stakes - if simulation fails, we will slowly reduce
     let mut remaining_indices: Vec<u8> = (0..32).collect();
     let mut postponed_indices: Vec<u8> = vec![];
-
+    let mut is_empty_claim = false;
     while !remaining_indices.is_empty() || !postponed_indices.is_empty() {
         let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
             &program.payer(),
@@ -100,8 +106,6 @@ pub async fn claim_stakes(
         };
 
         let simulated_cu = simulation.value.units_consumed.unwrap_or(0);
-        // let simulation_logs = simulation.value.logs.unwrap_or(vec![]);
-        // println!("   <> Simulation logs: {:?}", simulation_logs);
 
         if simulated_cu == 0 {
             log::warn!(
@@ -127,7 +131,18 @@ pub async fn claim_stakes(
             }
             continue;
         } else {
-            log::info!("   <> CU consumed: {}", simulated_cu);
+            // log::info!("   <> CU consumed: {}", simulated_cu);
+        }
+
+        let simulation_logs = simulation.value.logs.unwrap_or(vec![]);
+        println!("   <> Simulation logs: {:?}", simulation_logs);
+
+        is_empty_claim = simulation_logs
+            .contains(&"No reward tokens to claim at this time".to_string())
+            && simulation_logs.contains(&"No lm reward tokens to claim at this time".to_string());
+        if is_empty_claim {
+            log::info!("   <> No reward tokens to claim at this time");
+            // let the claim be called then return NoRewardTokens to update the cache manually
         }
 
         let (claim_stakes_params, claim_stakes_accounts) = create_claim_stakes_ix(
@@ -185,16 +200,16 @@ pub async fn claim_stakes(
                 backoff::Error::transient(e.into())
             })?;
 
-        log::info!(
-            "   <> Claim stakes for staking account {:#?} - TX sent: {:#?}",
-            user_staking_account_key,
-            tx_hash.to_string(),
-        );
+        log::info!("   <> TX sent: {:#?}", tx_hash.to_string());
 
         // Reset remaining indices and move postponed indices to remaining
         remaining_indices = postponed_indices;
         postponed_indices = vec![];
     }
 
-    Ok(())
+    if is_empty_claim {
+        Ok(ClaimStakeOutcome::NoRewardTokens)
+    } else {
+        Ok(ClaimStakeOutcome::Success)
+    }
 }
