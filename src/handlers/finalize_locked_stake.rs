@@ -2,7 +2,7 @@ use {
     crate::handlers::create_finalize_locked_stake_ix,
     adrena_abi::{
         get_governing_token_holding_pda, get_staking_pda, get_token_owner_record_pda,
-        get_transfer_authority_pda, ADRENA_GOVERNANCE_REALM_CONFIG_ID, ADRENA_GOVERNANCE_REALM_ID,
+        get_transfer_authority_pda, ADRENA_GOVERNANCE_REALM_ID,
         ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT, ADX_MINT, SPL_TOKEN_PROGRAM_ID, USDC_MINT,
     },
     anchor_client::Program,
@@ -29,13 +29,15 @@ pub async fn finalize_locked_stake(
     let transfer_authority_pda = get_transfer_authority_pda().0;
     let staking_pda = get_staking_pda(staked_token_mint).0;
 
-    let governance_governing_token_holding_pda =
-        get_governing_token_holding_pda(&staking_pda, &ADRENA_GOVERNANCE_REALM_CONFIG_ID);
+    let governance_governing_token_holding_pda = get_governing_token_holding_pda(
+        &ADRENA_GOVERNANCE_REALM_ID,
+        &ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT,
+    );
 
     let governance_governing_token_owner_record_pda = get_token_owner_record_pda(
-        &governance_governing_token_holding_pda,
-        &ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT,
         &ADRENA_GOVERNANCE_REALM_ID,
+        &ADRENA_GOVERNANCE_SHADOW_TOKEN_MINT,
+        &owner_pubkey,
     );
 
     let rpc_client = program.rpc();

@@ -134,6 +134,13 @@ where
                                     &user_staking_account,
                                 )
                                 .await;
+                                // Update the finalize locked stakes cache
+                                update_finalize_locked_stakes_cache_for_account(
+                                    finalize_locked_stakes_cache,
+                                    &account_key,
+                                    &user_staking_account,
+                                )
+                                .await;
                             }
                             UserStakingAccountUpdate::MissingStakingType(_) => {
                                 log::info!(

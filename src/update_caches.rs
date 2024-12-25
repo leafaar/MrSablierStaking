@@ -127,8 +127,15 @@ pub async fn update_finalize_locked_stakes_cache_for_account(
     user_staking_account_key: &Pubkey,
     user_staking_account: &UserStaking,
 ) {
+    // Remove all elements from the cache (in order to not reprocess the same finalize stake multiple times)
+    finalize_locked_stakes_cache
+        .write()
+        .await
+        .entry(*user_staking_account_key)
+        .or_insert_with(HashMap::new);
+    //
     for ls in user_staking_account.locked_stakes.iter() {
-        if ls.amount != 0 {
+        if ls.amount != 0 && ls.resolved == 0 {
             finalize_locked_stakes_cache
                 .write()
                 .await
