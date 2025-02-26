@@ -1,3 +1,7 @@
+use crate::handlers::update_pool_aum;
+use adrena_abi::Custody;
+use adrena_abi::Pool;
+use solana_sdk::instruction::AccountMeta;
 use {
     crate::{process_stream_message::process_stream_message, update_caches::update_claim_cache},
     adrena_abi::{
@@ -37,10 +41,6 @@ use {
         },
     },
 };
-use solana_sdk::instruction::AccountMeta;
-use crate::handlers::update_pool_aum;
-use adrena_abi::Custody;
-use adrena_abi::Pool;
 
 type AccountFilterMap = HashMap<String, SubscribeRequestFilterAccounts>;
 
@@ -155,6 +155,7 @@ async fn generate_accounts_filter_map(
             account: vec![],
             owner: staking_owner,
             filters: vec![staking_filter_discriminator],
+            nonempty_txn_signature: None,
         },
     );
     // We don't monitor Staking accounts for close events - These are ever lasting accounts
@@ -184,6 +185,7 @@ async fn generate_accounts_filter_map(
             account: vec![],
             owner: user_staking_owner,
             filters: vec![user_staking_filter_discriminator],
+            nonempty_txn_signature: None,
         },
     );
 
@@ -194,6 +196,7 @@ async fn generate_accounts_filter_map(
             account: existing_user_staking_accounts_keys,
             owner: vec![],
             filters: vec![],
+            nonempty_txn_signature: None,
         },
     );
 
@@ -357,13 +360,13 @@ async fn main() -> anyhow::Result<()> {
                         log::info!("  <> # of existing UserStaking accounts w/o staking type defined filtered out: {}", existing_user_staking_accounts_len - existing_user_staking_accounts_with_staking_type.len());
 
                         // DEBUG helper
-                        // let target_account = Pubkey::from_str("").unwrap(); 
+                        // let target_account = Pubkey::from_str("").unwrap();
                         // let existing_user_staking_accounts_with_staking_type: HashMap<Pubkey, UserStaking> = existing_user_staking_accounts_with_staking_type
                         //     .into_iter()
                         //     .filter(|(k,_)| *k == target_account)
                         //     .collect();
                         // END DEBUG helper
-                        
+
                         indexed_user_staking_accounts.extend(existing_user_staking_accounts_with_staking_type);
                     }
                     log::info!(
@@ -455,20 +458,20 @@ async fn main() -> anyhow::Result<()> {
             let mut custodies_trade_oracle_accounts: Vec<AccountMeta> = vec![];
             for key in pool.custodies.iter() {
                 if key != &Pubkey::default() {
-                    
+
                     custodies_accounts.push(AccountMeta {
                         pubkey: key.clone(),
                         is_signer: false,
                         is_writable: false,
                     });
-                    
+
                     let oracle_key = indexed_custodies.read().await[key].oracle;
                     custodies_oracle_accounts.push(AccountMeta {
                         pubkey: oracle_key,
                         is_signer: false,
                         is_writable: false,
                     });
-                    
+
                     let trade_oracle_key = indexed_custodies.read().await[key].trade_oracle;
                     if trade_oracle_key != oracle_key {
                         custodies_trade_oracle_accounts.push(AccountMeta {
@@ -486,8 +489,8 @@ async fn main() -> anyhow::Result<()> {
             // CORE LOOP
             //
             // Here we wait for new messages from the stream and process them
-            // if coming from the price update v2 accounts, we check for 
-            // liquidation/sl/tp conditions on the already indexed positions if 
+            // if coming from the price update v2 accounts, we check for
+            // liquidation/sl/tp conditions on the already indexed positions if
             // coming from the position accounts, we update the indexed positions map
             // ////////////////////////////////////////////////////////////////
             log::info!("4 - Start core loop: processing gRPC stream...");
@@ -698,16 +701,23 @@ async fn process_finalize_locked_stakes(
         for (stake_resolution_thread_id, end_time) in locked_stakes.iter() {
             if current_time >= *end_time {
                 // check that the locked stake is not resolved == 1
-                let indexed_user_staking_accounts_read =
-                    indexed_user_staking_accounts.read().await;
+                let indexed_user_staking_accounts_read = indexed_user_staking_accounts.read().await;
                 let user_staking_account = indexed_user_staking_accounts_read
                     .get(user_staking_account_key)
                     .expect("UserStaking account not found in the indexed user staking accounts");
-                if !user_staking_account.locked_stakes.iter().any(|ls| ls.id == *stake_resolution_thread_id) {
+                if !user_staking_account
+                    .locked_stakes
+                    .iter()
+                    .any(|ls| ls.id == *stake_resolution_thread_id)
+                {
                     log::info!("Locked stake not found in user staking account - skipping");
                     continue;
                 }
-                if user_staking_account.locked_stakes.iter().any(|ls| ls.id == *stake_resolution_thread_id && ls.resolved == 1) {
+                if user_staking_account
+                    .locked_stakes
+                    .iter()
+                    .any(|ls| ls.id == *stake_resolution_thread_id && ls.resolved == 1)
+                {
                     log::info!("Locked stake already resolved - skipping");
                     continue;
                 }
