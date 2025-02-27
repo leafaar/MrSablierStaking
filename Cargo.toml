@@ -13,6 +13,9 @@ publish = true
 path = "./src/client.rs"
 name = "mrsablierstaking"
 
+[[example]]
+name = "grpc_test"
+path = "examples/grpc_test.rs"
 
 [dependencies]
 adrena-abi = { git = "https://github.com/AdrenaFoundation/adrena-abi.git", rev = "5adb012b2f22d086c70d8fa97f08b68db75c49ed" } # cannot use latest as there is an issue updating crate with TLS
@@ -33,7 +36,9 @@ postgres-openssl = "0.5.0"
 serde_json = "1.0.86"
 solana-client = "=2.1.7"
 solana-sdk = "=2.1.7"
-spl-associated-token-account = { version = "=6.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "=6.0.0", features = [
+    "no-entrypoint",
+] }
 tokio = { version = "1.21.2", features = ["rt-multi-thread"] }
 tokio-postgres = "0.7.12"
 tonic = "0.12.3"
